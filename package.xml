@@ -3,15 +3,18 @@
 <package format="3">
   <name>scratch_hci_bridge</name>
   <version>0.1.0</version>
-  <description>Bridge Scratch HCI HTTP commands to OperaSim ROS 2 topics.</description>
+  <description>Bridge Scratch HCI HTTP commands to TB20e ROS 2 control.</description>
   <maintainer email="hkmp5a5.ki@gmail.com">iszwm3</maintainer>
   <license>Apache-2.0</license>
 
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

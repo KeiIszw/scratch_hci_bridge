@@ -24,6 +24,14 @@ class CommandStateTest(unittest.TestCase):
         self.assertTrue(state.apply_command("body", 720.0))
         self.assertEqual(state.next_frame().joints_deg["body"], 720.0)
 
+    def test_swing_uses_tb20e_continuous_angle_range(self) -> None:
+        state = CommandState()
+
+        self.assertTrue(state.apply_command("swing", 270.0))
+        self.assertEqual(state.next_frame().joints_deg["swing"], 180.0)
+        self.assertTrue(state.apply_command("swing", -270.0))
+        self.assertEqual(state.next_frame().joints_deg["swing"], -180.0)
+
     def test_crawler_speeds_are_converted_to_twist(self) -> None:
         state = CommandState(drive_linear_scale=2.0, drive_angular_scale=3.0)
 
@@ -43,9 +51,17 @@ class CommandStateTest(unittest.TestCase):
         state = CommandState()
 
         self.assertFalse(state.apply_command("unknown", 1.0))
-        self.assertFalse(state.apply_command("boom_speed", 1.0))
+        self.assertFalse(state.apply_command("boom_speed", -1.0))
         self.assertFalse(state.apply_command("boom", float("nan")))
         self.assertFalse(state.apply_command("boom", float("inf")))
+
+    def test_pid_joint_speed_limit_can_be_set_and_disabled(self) -> None:
+        state = CommandState()
+
+        self.assertTrue(state.apply_command("boom_speed", 5.0))
+        self.assertEqual(state.snapshot().joint_speed_limits_deg_s["boom"], 5.0)
+        self.assertTrue(state.apply_command("boom_speed", 0.0))
+        self.assertIsNone(state.snapshot().joint_speed_limits_deg_s["boom"])
 
     def test_supported_commands_are_absolute_joints_and_crawlers(self) -> None:
         state = CommandState()
@@ -61,6 +77,10 @@ class CommandStateTest(unittest.TestCase):
         self.assertEqual(JOINT_NAMES, expected_joints)
         expected_commands = {
             *expected_joints,
+            "swing_speed",
+            "boom_speed",
+            "arm_speed",
+            "bucket_speed",
             "left_crawler_speed",
             "right_crawler_speed",
         }

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 
 
 JOINT_NAMES = ("blade", "body", "swing", "boom", "arm", "bucket", "thumb")
+PID_JOINT_NAMES = ("swing", "boom", "arm", "bucket")
+JOINT_SPEED_COMMANDS = {
+    f"{joint}_speed": joint for joint in PID_JOINT_NAMES
+}
 
 INITIAL_JOINT_DEG = {
     "blade": 0.0,
@@ -19,21 +23,24 @@ INITIAL_JOINT_DEG = {
 
 JOINT_LIMITS_DEG = {
     "blade": (-30.0, 15.0),
-    "swing": (-49.0, 78.0),
+    "swing": (-180.0, 180.0),
     "boom": (-83.0, 48.0),
     "arm": (32.0, 155.0),
     "bucket": (-31.0, 159.0),
     "thumb": (0.0, 140.0),
 }
 
-SUPPORTED_COMMANDS = frozenset(JOINT_NAMES) | frozenset(
-    ("left_crawler_speed", "right_crawler_speed")
+SUPPORTED_COMMANDS = (
+    frozenset(JOINT_NAMES)
+    | frozenset(JOINT_SPEED_COMMANDS)
+    | frozenset(("left_crawler_speed", "right_crawler_speed"))
 )
 
 
 @dataclass(frozen=True)
 class CommandSnapshot:
     joints_deg: dict[str, float]
+    joint_speed_limits_deg_s: dict[str, float | None]
     left_crawler_speed: float
     right_crawler_speed: float
 
@@ -61,6 +68,9 @@ class CommandState:
 
         self._lock = threading.Lock()
         self._joints_deg = dict(INITIAL_JOINT_DEG)
+        self._joint_speed_limits_deg_s = {
+            joint: None for joint in PID_JOINT_NAMES
+        }
         self._left_crawler_speed = 0.0
         self._right_crawler_speed = 0.0
         self._drive_linear_scale = drive_linear_scale
@@ -72,6 +82,14 @@ class CommandState:
         with self._lock:
             if command in self._joints_deg:
                 self._joints_deg[command] = _clamp_joint(command, value)
+                return True
+            speed_joint = JOINT_SPEED_COMMANDS.get(command)
+            if speed_joint is not None:
+                if value < 0.0:
+                    return False
+                self._joint_speed_limits_deg_s[speed_joint] = (
+                    value if value > 0.0 else None
+                )
                 return True
             if command == "left_crawler_speed":
                 if not self._drive_is_finite(value, self._right_crawler_speed):
@@ -107,6 +125,7 @@ class CommandState:
         with self._lock:
             return CommandSnapshot(
                 joints_deg=dict(self._joints_deg),
+                joint_speed_limits_deg_s=dict(self._joint_speed_limits_deg_s),
                 left_crawler_speed=self._left_crawler_speed,
                 right_crawler_speed=self._right_crawler_speed,
             )

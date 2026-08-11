@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer="iszwm3",
     maintainer_email="hkmp5a5.ki@gmail.com",
-    description="Bridge Scratch HCI HTTP commands to OperaSim ROS 2 topics.",
+    description="Bridge Scratch HCI HTTP commands to TB20e ROS 2 control.",
     license="Apache-2.0",
     url="https://github.com/KeiIszw/ros2_ws",
     tests_require=["pytest"],

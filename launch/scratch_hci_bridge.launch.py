@@ -14,6 +14,13 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("http_port", default_value="8899"),
             DeclareLaunchArgument("drive_linear_scale", default_value="1.0"),
             DeclareLaunchArgument("drive_angular_scale", default_value="1.0"),
+            DeclareLaunchArgument(
+                "trajectory_action",
+                default_value="/tb20e_controller/follow_joint_trajectory",
+            ),
+            DeclareLaunchArgument("joint_state_topic", default_value="/joint_states"),
+            DeclareLaunchArgument("trajectory_duration_sec", default_value="3.0"),
+            DeclareLaunchArgument("trajectory_debounce_sec", default_value="0.05"),
             Node(
                 package="scratch_hci_bridge",
                 executable="scratch_hci_bridge",
@@ -34,6 +41,16 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "drive_angular_scale": ParameterValue(
                             LaunchConfiguration("drive_angular_scale"), value_type=float
+                        ),
+                        "trajectory_action": LaunchConfiguration("trajectory_action"),
+                        "joint_state_topic": LaunchConfiguration("joint_state_topic"),
+                        "trajectory_duration_sec": ParameterValue(
+                            LaunchConfiguration("trajectory_duration_sec"),
+                            value_type=float,
+                        ),
+                        "trajectory_debounce_sec": ParameterValue(
+                            LaunchConfiguration("trajectory_debounce_sec"),
+                            value_type=float,
                         ),
                     }
                 ],

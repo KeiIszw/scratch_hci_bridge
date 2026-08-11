@@ -48,10 +48,21 @@ class HttpServerTest(unittest.TestCase):
             self.assertEqual(state.snapshot().joints_deg["boom"], -30.0)
             self.assertEqual(received, [("boom", -30.0)])
 
-            status, body, _ = _get(
-                f"{base_url}?type=command&cmd=boom_speed&val=1"
+            self.assertEqual(
+                _get(f"{base_url}?type=command&cmd=boom_speed&val=5"),
+                (200, "OK", "*"),
             )
-            self.assertEqual((status, body), (400, "unknown cmd: boom_speed"))
+            self.assertEqual(
+                state.snapshot().joint_speed_limits_deg_s["boom"], 5.0
+            )
+            self.assertEqual(received[-1], ("boom_speed", 5.0))
+
+            status, body, _ = _get(
+                f"{base_url}?type=command&cmd=boom_speed&val=-1"
+            )
+            self.assertEqual(
+                (status, body), (400, "joint speed must be non-negative")
+            )
 
             result = _get(f"{base_url}?type=reporter&cmd=boom&val=0")
             self.assertEqual(result, (400, "type=command is required", "*"))

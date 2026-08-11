@@ -5,7 +5,11 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from scratch_hci_bridge.command_state import CommandState, SUPPORTED_COMMANDS
+from scratch_hci_bridge.command_state import (
+    CommandState,
+    JOINT_SPEED_COMMANDS,
+    SUPPORTED_COMMANDS,
+)
 
 
 CommandCallback = Callable[[str, float], None]
@@ -50,6 +54,9 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         if command not in SUPPORTED_COMMANDS:
             self._send_text(400, f"unknown cmd: {command}")
+            return
+        if command in JOINT_SPEED_COMMANDS and value < 0.0:
+            self._send_text(400, "joint speed must be non-negative")
             return
         if not self.state.apply_command(command, value):
             self._send_text(400, "command would produce a non-finite value")
