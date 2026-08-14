@@ -3,8 +3,12 @@ import unittest
 
 from scratch_hci_bridge.command_state import (
     CommandState,
+    ExecutionMode,
     JOINT_NAMES,
+    MAX_ROS_DURATION_SEC,
+    RELATIVE_JOINT_COMMANDS,
     SUPPORTED_COMMANDS,
+    is_ros_duration_safe,
 )
 
 
@@ -52,6 +56,8 @@ class CommandStateTest(unittest.TestCase):
 
         self.assertFalse(state.apply_command("unknown", 1.0))
         self.assertFalse(state.apply_command("boom_speed", -1.0))
+        self.assertFalse(state.apply_command("boom_speed", 5e-324))
+        self.assertFalse(state.apply_command("boom_speed", 1e-100))
         self.assertFalse(state.apply_command("boom", float("nan")))
         self.assertFalse(state.apply_command("boom", float("inf")))
 
@@ -63,7 +69,50 @@ class CommandStateTest(unittest.TestCase):
         self.assertTrue(state.apply_command("boom_speed", 0.0))
         self.assertIsNone(state.snapshot().joint_speed_limits_deg_s["boom"])
 
-    def test_supported_commands_are_absolute_joints_and_crawlers(self) -> None:
+    def test_ros_duration_boundary_is_validated(self) -> None:
+        self.assertTrue(is_ros_duration_safe(MAX_ROS_DURATION_SEC))
+        self.assertFalse(is_ros_duration_safe(MAX_ROS_DURATION_SEC + 1.0))
+
+    def test_execution_mode_defaults_to_serial_and_ignores_dummy_value(self) -> None:
+        state = CommandState()
+
+        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.SERIAL)
+        self.assertTrue(state.apply_command("parallel", 123.0))
+        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.PARALLEL)
+        self.assertTrue(state.apply_command("serial", -456.0))
+        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.SERIAL)
+
+    def test_relative_joint_command_is_accepted_without_precomputing_target(self) -> None:
+        state = CommandState()
+
+        self.assertTrue(state.apply_command("boom_up", -10.0))
+        self.assertEqual(state.snapshot().joints_deg["boom"], -83.0)
+        actual_commands = {
+            name: (spec.joint, spec.direction)
+            for name, spec in RELATIVE_JOINT_COMMANDS.items()
+        }
+        self.assertEqual(
+            actual_commands,
+            {
+                "swing_left": ("swing", 1.0),
+                "swing_right": ("swing", -1.0),
+                "boom_up": ("boom", -1.0),
+                "boom_down": ("boom", 1.0),
+                "arm_extend": ("arm", -1.0),
+                "arm_retract": ("arm", 1.0),
+                "bucket_dump": ("bucket", -1.0),
+                "bucket_scoop": ("bucket", 1.0),
+            },
+        )
+
+        self.assertTrue(state.apply_command("swing_left", -179.999))
+        self.assertTrue(state.apply_command("swing_right", 179.999))
+        self.assertFalse(state.apply_command("swing_left", 180.0))
+        self.assertFalse(state.apply_command("swing_right", -181.0))
+        self.assertFalse(state.apply_command("end_dump", 10.0))
+        self.assertFalse(state.apply_command("end_scoop", 10.0))
+
+    def test_supported_commands_include_absolute_relative_and_crawlers(self) -> None:
         state = CommandState()
         expected_joints = (
             "blade",
@@ -81,6 +130,16 @@ class CommandStateTest(unittest.TestCase):
             "boom_speed",
             "arm_speed",
             "bucket_speed",
+            "serial",
+            "parallel",
+            "swing_left",
+            "swing_right",
+            "boom_up",
+            "boom_down",
+            "arm_extend",
+            "arm_retract",
+            "bucket_dump",
+            "bucket_scoop",
             "left_crawler_speed",
             "right_crawler_speed",
         }

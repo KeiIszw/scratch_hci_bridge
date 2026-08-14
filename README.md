@@ -1,6 +1,6 @@
 # scratch_hci_bridge
 
-Scratch 3のHCI extensionからHTTPで受けた絶対角度命令を、TB20eの
+Scratch 3のHCI extensionからHTTPで受けた絶対・相対角度命令を、TB20eの
 `joint_trajectory_controller`へ送る`ament_python`パッケージです。rosbridgeを介さず、
 `rclpy`から直接送信します。
 
@@ -21,7 +21,7 @@ Scratch HCI command block
 | 入力 | ROS 2出力 |
 |---|---|
 | 左右クローラ速度 | `/tb20e/tracks/cmd_vel` (`geometry_msgs/msg/Twist`) |
-| `swing`, `boom`, `arm`, `bucket`の目標角度 | `/tb20e_controller/follow_joint_trajectory` (`control_msgs/action/FollowJointTrajectory`, rad) |
+| `swing`, `boom`, `arm`, `bucket`の絶対・相対角 | `/tb20e_controller/follow_joint_trajectory` (`control_msgs/action/FollowJointTrajectory`, rad) |
 | `blade`, `body`, `thumb`の目標角度 | `/tb20e/<joint>/cmd` (`std_msgs/msg/Float64`, rad) |
 
 ## ビルドと起動
@@ -54,47 +54,154 @@ ScratchとROS 2が同じPCなら、HCI extensionの既定値`http://localhost`, 
 HTTPだけを確認する例:
 
 ```bash
+# 既定はserial。明示する場合もvalにはダミー値を指定する
+curl 'http://localhost:8899/?type=command&cmd=serial&val=1'
 curl 'http://localhost:8899/?type=command&cmd=boom&val=-30'
-curl 'http://localhost:8899/?type=command&cmd=bucket&val=45'
+curl 'http://localhost:8899/?type=command&cmd=boom_up&val=10'
+curl 'http://localhost:8899/?type=command&cmd=swing_left&val=30'
+curl 'http://localhost:8899/?type=command&cmd=bucket_dump&val=15'
+
+# 以後のPID関節命令をparallelへ切り替える
+curl 'http://localhost:8899/?type=command&cmd=parallel&val=1'
+curl 'http://localhost:8899/?type=command&cmd=boom&val=-50'
+curl 'http://localhost:8899/?type=command&cmd=arm&val=100'
+
+# crawlerは実行モードの対象外
 curl 'http://localhost:8899/?type=command&cmd=left_crawler_speed&val=0.5'
 curl 'http://localhost:8899/?type=command&cmd=right_crawler_speed&val=0.5'
 ```
 
-成功時は`200 OK`と本文`OK`、入力不正時は`400`を返します。ただしHCIのcommand blockは`no-cors`で応答を待たないため、Scratch画面からstatusや本文は確認できません。ノードログには受理した命令が表示されます。不正命令の理由は同じURLを`curl`で実行して確認してください。
+成功時は`200 OK`と本文`OK`、入力不正時は`400`を返します。HCIのcommand blockは
+`no-cors`のためstatusや本文をScratch画面から確認できませんが、同梱版は通信完了を待って
+次のブロックへ進みます。ノードログには受理した命令が表示されます。不正命令の理由は同じ
+URLを`curl`で実行して確認してください。
 
-同じ理由で、連続するHTTP命令の呼出順は通信上保証されません。本ノードは到着した順に処理します。最終状態が順序に依存する命令間にはScratchの`待つ`ブロックを入れてください。厳密な順序保証が必要な場合は、HCI extension側の`commandURL`が`fetch`のPromiseを返すよう変更する必要があります。
+同梱のHCI extensionは`commandURL`から`fetch`のPromiseを返し、HTTP受付が完了してから
+次のcommand blockへ進むため、ブロックの呼出順を維持します。古いHCI extensionは連続する
+`fetch`の完了を待たないため更新してください。本ノード側でもHTTPサーバへ到着した順を保持し、
+古いextensionで最初のモード命令だけがわずかに遅着した場合は直前の未確定バッチへ適用します。
 
 ## command
 
 - 絶対目標角度[deg]: `blade`, `body`, `swing`, `boom`, `arm`, `bucket`, `thumb`
+- PID関節の相対移動量[deg]: `swing_left`, `swing_right`, `boom_up`,
+  `boom_down`, `arm_extend`, `arm_retract`, `bucket_dump`, `bucket_scoop`
 - PID関節の角速度上限[deg/s]: `swing_speed`, `boom_speed`, `arm_speed`,
   `bucket_speed`
+- PID関節の実行モード: `serial`, `parallel`（`val`は未使用）
 - 左右クローラ速度: `left_crawler_speed`, `right_crawler_speed`
 
-関節命令は`cmd=<関節名>&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
+絶対関節命令は`cmd=<関節名>&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
 `arm`, `bucket`は、受理した角度を可動域内へ制限し、4軸をまとめてradへ変換して
 `FollowJointTrajectory` goalとして送ります。今回のHTTPバッチで指定されていない軸は、
 送信時点の最新`/joint_states`角度で保持します。現在角度が揃う前に受信した命令は破棄せず
-保留します。送信済みの目標は次のgoalへ引き継がないため、未達または失敗した軸が後続する
-別軸の命令を妨げません。
+保留します。次のgoalは最新feedbackを基準に作ります。Action成功後に新しいfeedbackがまだ
+届いていない、または成功目標の許容差外にある途中サンプルしかない軸は、古い角度へ戻すことを
+防ぐため成功した目標角度で補完します。
 
-短時間に複数軸のHTTP命令を受信した場合は、`trajectory_debounce_sec`の間待って1つのgoalへ
-まとめます。同じgoalを50 Hzで再送しません。角速度上限を設定していない軸の到達時間は
-`trajectory_duration_sec`で指定します。PID関節goalは位置のみの線形補間を使います。
+相対関節命令はOCS20250118と同じく、`val`の符号を無視して移動量の大きさ[deg]として
+使用します。方向はコマンド名で決まります。
 
-PID関節は`cmd=<関節名>_speed&val=<角速度上限[deg/s]>`を先に送ると、その後の角度goalに
-角速度上限を適用します。到達時間は次のように自動計算されます。
+| HTTP command | 対象軸 | 目標角度 |
+|---|---|---|
+| `swing_left` / `swing_right` | swing（車体上部旋回） | 現在角 `+ abs(val)` / `- abs(val)` |
+| `boom_up` / `boom_down` | boom | 現在角 `- abs(val)` / `+ abs(val)` |
+| `arm_extend` / `arm_retract` | arm | 現在角 `- abs(val)` / `+ abs(val)` |
+| `bucket_dump` / `bucket_scoop` | bucket | 現在角 `- abs(val)` / `+ abs(val)` |
 
-```text
-角速度上限設定軸の到達時間 = |目標角度 - 現在角度| / 角速度上限
+```bash
+# 現在のboom角度から10 degree上げる（val=-10でも移動量は10 degree）
+curl 'http://localhost:8899/?type=command&cmd=boom_up&val=-10'
 ```
 
-角速度上限設定時に`trajectory_duration_sec`を最短時間としては使用しません。複数軸を同時に
+相対角はHTTP受信時ではなく、その命令を実行する直前のfeedbackから計算します。
+`boom`, `arm`, `bucket`は絶対・相対命令を合成した後に可動域へ制限します。
+これら3軸ではOperaSimの関節座標に合わせ、up/extend/dumpを負方向、
+down/retract/scoopを正方向として扱います。
+`swing_left`はROS正方向、`swing_right`はROS負方向へ車体上部を連続旋回させます。
+方向を保証するため、1命令の移動量は`abs(val) < 180` degreeに制限し、180 degree以上は
+`400 Bad Request`で拒否します。例えば現在角170 degreeで`swing_left=30`を実行すると、
+目標をラップせず200 degreeとして送り、右へ160 degree逆回転することを防ぎます。
+
+### serial / parallel
+
+起動時の実行モードは`serial`です。モードの変更は次のHTTP命令で行います。共通の
+command block形式に合わせて`val`が必要ですが、モード選択には値を使用しません。
+
+```bash
+curl 'http://localhost:8899/?type=command&cmd=serial&val=1'
+curl 'http://localhost:8899/?type=command&cmd=parallel&val=1'
+```
+
+`serial`ではバッチ内のPID関節命令をHTTP到着順のFIFOで1件ずつgoalにし、先行goalが
+`FollowJointTrajectory` Actionで成功完了してから次のgoalを送ります。例えば次の命令では、
+boomを現在角から10 degree上げ終えてから、armをその時点の角度から15 degree縮めます。
+
+各goalには既定で位置許容差0.75 degree、停止速度許容値0.5 degree/sを明示し、
+controllerがその条件で成功を返すまで後続を開始しません。
+
+```bash
+curl 'http://localhost:8899/?type=command&cmd=serial&val=1'
+curl 'http://localhost:8899/?type=command&cmd=boom_up&val=10'
+curl 'http://localhost:8899/?type=command&cmd=arm_retract&val=15'
+```
+
+TB20eのarm可動域は32--155 degreeです。絶対命令`arm=30`や、相対命令を合成した結果が
+可動域外になる場合は、従来どおり32 degreeへ制限されます。
+
+`parallel`では`trajectory_debounce_sec`内に連続して届いたPID関節命令を1つの4軸goalへ
+まとめ、各軸を同時に開始します。同じバッチで同じ軸を複数回指定した場合は、最後の絶対角を
+使用します。相対命令は共通のfeedbackを原点として同じ軸の移動量を加算します。絶対・相対が
+混在した軸は「最後の絶対角 + 全相対移動量」を目標にします。厳密な命令順で同じ軸を段階的に
+動かす場合は`serial`を使用してください。実行中のgoalがある場合は、モードにかかわらず
+後続バッチをFIFOで待機させ、先行goalを新しいgoalで途中終了させません。
+連続関節で左右方向を保証するため、同じparallelバッチに複数の`swing`系命令がある場合だけは
+到着順の個別goalへ自動分割します。`swing`の絶対角と`swing_left/right`の混在も同様です。
+
+```bash
+# 同じfeedback snapshotからboomとarmを同時に相対移動する
+curl 'http://localhost:8899/?type=command&cmd=parallel&val=1'
+curl 'http://localhost:8899/?type=command&cmd=boom_up&val=10'
+curl 'http://localhost:8899/?type=command&cmd=arm_retract&val=15'
+```
+
+モード命令はバッチ境界です。すでに確定済みまたは実行中のバッチのモードは変更せず、
+後続命令へ新しいモードを適用します。例外として、起動後最初の明示的なモード命令が
+未確定の運動命令よりわずかに遅着した場合だけ、その未確定バッチへ最初のモードを適用します。
+このためモード未指定時の最初のバッチは`initial_mode_command_wait_sec`だけ待ち、既定の
+`serial`で実行します。最初からモード命令を送った場合、通常の
+`trajectory_debounce_sec`だけ待ちます。
+
+Actionが拒否・中断・キャンセル・失敗した場合、serialの後続だけが動くことを防ぐため、
+待機中のPID関節命令を破棄します。選択中のモードは維持されるので、その後に受信した新しい
+関節命令は実行できます。
+
+goal応答が`trajectory_goal_response_timeout_sec`を超えて返らない場合は、サーバ側で受理済みか
+判定できないため、安全側として実行キューを閉じたままエラーを記録します。受理済みgoalが
+予定時間と`trajectory_result_timeout_margin_sec`の合計を超えても終端しない場合はcancelを要求し、
+cancel後の終端resultを確認するまで後続goalを送りません。Action通信障害により終端状態を確認
+できない場合は、重複goalを防ぐためノードを再起動するまでキューを閉じたままにします。
+
+角速度上限を設定していない軸の到達時間は`trajectory_duration_sec`で指定します。
+PID関節goalは位置のみの線形補間を使い、同じgoalを50 Hzで再送しません。
+
+PID関節は`cmd=<関節名>_speed&val=<角速度上限[deg/s]>`を先に送ると、その後に受信した
+角度命令へ角速度上限を記録します。待機中に速度設定を変更しても、受信済み命令の速度は
+変わりません。到達時間は次のように自動計算されます。
+
+```text
+角速度上限設定軸の到達時間 = |制限後の目標角度 - 実行開始時の現在角度| / 角速度上限
+```
+
+角速度上限設定時に`trajectory_duration_sec`を最短時間としては使用しません。parallelで複数軸を同時に
 変更した場合は、各軸について上式で求めた時間の最大値をgoal全体へ適用します。角速度上限が
 設定されていない変更軸が含まれる場合、その軸には従来どおり`trajectory_duration_sec`を使います。
 
 複数軸を同じHTTPバッチで更新した場合は、全軸の速度上限を守れる共通到達時間を使います。
-`0`を送ると、その軸の速度上限を解除して固定到達時間方式へ戻します。負値と非数は拒否します。
+parallelの同じ軸へ複数の命令が寄与する場合は、記録された角速度上限のうち最も遅い値を使い、
+上限未設定の命令も含まれる場合は`trajectory_duration_sec`も下限候補にします。
+`0`を送ると、その軸の速度上限を解除して固定到達時間方式へ戻します。負値、非数、および
+ROSの`Duration`で表現できないほど小さい正値は拒否します。
 
 ```bash
 # boomを最大5 deg/sに設定し、その後-30 degreeへ動かす
@@ -109,7 +216,14 @@ curl 'http://localhost:8899/?type=command&cmd=boom_speed&val=0'
 PID追従のオーバーシュートにより一時的に上限を超える場合があります。この機能は実機向けの
 独立した安全速度リミッタの代わりにはなりません。
 
+実行モードの対象はAction完了を判定できる`swing`, `boom`, `arm`, `bucket`です。
 `blade`, `body`, `thumb`はtb20eのPID対象外であり、従来どおり個別topicへ直接送ります。
+そのためOCSの`base_left/right`, `blade_up/down`, `thumb_open/close`とcrawlerの方向・角度
+コマンドは未対応です。OperaSimでは車体上部旋回を`swing_left/right`として公開します。
+OCSの`base`は車体上部旋回、OCSの`swing`は別のブームスイング関節なので、`base_left/right`
+を同じ軸の別名にはしていません。今回OCSを参考に追加した相対コマンドは上記の
+`swing`, `boom`, `arm`, `bucket`用コマンドであり、
+`boom_angle`などの絶対角別名や、大文字・hyphen・空白を含むコマンド名の正規化は行いません。
 左右クローラは次の式で`Twist`へ変換します。
 
 ```text
@@ -130,7 +244,14 @@ angular.z = (right - left) / 2 * drive_angular_scale
 | `trajectory_action` | `/tb20e_controller/follow_joint_trajectory` | 4軸目標の送信先Action |
 | `joint_state_topic` | `/joint_states` | 未指定軸の初期化に使う現在角度 |
 | `trajectory_duration_sec` | `3.0` | 角速度上限を設定していない軸の到達時間[s] |
-| `trajectory_debounce_sec` | `0.05` | 連続する角度命令をまとめる待ち時間[s] |
+| `trajectory_debounce_sec` | `0.5` | 連続する角度命令をまとめる待ち時間[s] |
+| `initial_mode_command_wait_sec` | `0.5` | 最初の明示モードが遅着しても未確定バッチへ適用できる待ち時間[s] |
+| `joint_state_timeout_sec` | `0.5` | 相対角と未指定軸の基準に使えるfeedbackの最大経過時間[s]（`0`で監視無効） |
+| `trajectory_goal_tolerance_deg` | `0.75` | Action成功とみなす各PID関節の位置許容差[deg] |
+| `trajectory_stopped_velocity_deg_s` | `0.5` | Action成功とみなす各PID関節の停止速度許容値[deg/s] |
+| `trajectory_goal_response_timeout_sec` | `5.0` | goal応答待ちの警告時間[s]（超過時は状態不明のためキューを閉じたまま保持） |
+| `trajectory_result_timeout_margin_sec` | `35.0` | 指定到達時間を超えてresultを待つ猶予[s]（超過後はcancel要求） |
+| `trajectory_shutdown_cancel_timeout_sec` | `2.0` | ノード終了時にgoal応答・cancel・終端resultを待つ合計上限[s] |
 
 例:
 
@@ -139,9 +260,10 @@ ros2 launch scratch_hci_bridge scratch_hci_bridge.launch.py \
   excavator:=tb20e http_host:=127.0.0.1 http_port:=8899 publish_hz:=50.0
 ```
 
-HTTPの`200 OK`は命令を内部状態へ保存したことを示し、trajectory goalの受理や完了までは
-保証しません。goalの受理・失敗はノードログへ出力します。PID出力topicへ別ノードから同時に
-指令しないでください。終了時には走行停止の`Twist`を1回publishします。
+HTTPの`200 OK`は命令を内部キューへ保存したことを示し、trajectory goalの受理や完了までは
+保証しません。goalの送信・受理・完了・失敗と実行モードはノードログへ出力します。PID出力topicへ別ノードから同時に
+指令しないでください。終了時には走行停止の`Twist`を1回publishし、実行中のtrajectoryへ
+cancelを要求して`trajectory_shutdown_cancel_timeout_sec`の範囲で応答を待ちます。
 
 `http_host=0.0.0.0`ではLAN上の全interfaceから命令を受けます。Scratchと同じPCだけで使う場合は`http_host:=127.0.0.1`へ制限してください。このHTTP APIに認証機能はありません。
 

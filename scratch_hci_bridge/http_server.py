@@ -8,7 +8,10 @@ from urllib.parse import parse_qs, urlparse
 from scratch_hci_bridge.command_state import (
     CommandState,
     JOINT_SPEED_COMMANDS,
+    RELATIVE_JOINT_COMMANDS,
     SUPPORTED_COMMANDS,
+    is_safe_relative_swing_command,
+    is_safe_pid_speed_limit,
 )
 
 
@@ -55,8 +58,23 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         if command not in SUPPORTED_COMMANDS:
             self._send_text(400, f"unknown cmd: {command}")
             return
+        if (
+            command in RELATIVE_JOINT_COMMANDS
+            and not is_safe_relative_swing_command(command, value)
+        ):
+            self._send_text(
+                400, "relative swing angle must be less than 180 degrees"
+            )
+            return
         if command in JOINT_SPEED_COMMANDS and value < 0.0:
             self._send_text(400, "joint speed must be non-negative")
+            return
+        if (
+            command in JOINT_SPEED_COMMANDS
+            and value > 0.0
+            and not is_safe_pid_speed_limit(value)
+        ):
+            self._send_text(400, "joint speed would exceed ROS Duration range")
             return
         if not self.state.apply_command(command, value):
             self._send_text(400, "command would produce a non-finite value")
@@ -102,5 +120,5 @@ def create_http_server(
 
     BoundScratchHTTPRequestHandler.state = state
     BoundScratchHTTPRequestHandler.command_callback = staticmethod(command_callback)
-    # HCI blockはHTTP応答を待たないため、単一処理で到着順を保つ。
+    # Process one request at a time so commands are handed to ROS in arrival order.
     return ScratchHTTPServer((host, port), BoundScratchHTTPRequestHandler)

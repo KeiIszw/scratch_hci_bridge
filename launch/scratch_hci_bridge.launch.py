@@ -20,7 +20,26 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("joint_state_topic", default_value="/joint_states"),
             DeclareLaunchArgument("trajectory_duration_sec", default_value="3.0"),
-            DeclareLaunchArgument("trajectory_debounce_sec", default_value="0.05"),
+            DeclareLaunchArgument("trajectory_debounce_sec", default_value="0.5"),
+            DeclareLaunchArgument(
+                "initial_mode_command_wait_sec", default_value="0.5"
+            ),
+            DeclareLaunchArgument("joint_state_timeout_sec", default_value="0.5"),
+            DeclareLaunchArgument(
+                "trajectory_goal_tolerance_deg", default_value="0.75"
+            ),
+            DeclareLaunchArgument(
+                "trajectory_stopped_velocity_deg_s", default_value="0.5"
+            ),
+            DeclareLaunchArgument(
+                "trajectory_goal_response_timeout_sec", default_value="5.0"
+            ),
+            DeclareLaunchArgument(
+                "trajectory_result_timeout_margin_sec", default_value="35.0"
+            ),
+            DeclareLaunchArgument(
+                "trajectory_shutdown_cancel_timeout_sec", default_value="2.0"
+            ),
             Node(
                 package="scratch_hci_bridge",
                 executable="scratch_hci_bridge",
@@ -50,6 +69,42 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "trajectory_debounce_sec": ParameterValue(
                             LaunchConfiguration("trajectory_debounce_sec"),
+                            value_type=float,
+                        ),
+                        "initial_mode_command_wait_sec": ParameterValue(
+                            LaunchConfiguration("initial_mode_command_wait_sec"),
+                            value_type=float,
+                        ),
+                        "joint_state_timeout_sec": ParameterValue(
+                            LaunchConfiguration("joint_state_timeout_sec"),
+                            value_type=float,
+                        ),
+                        "trajectory_goal_tolerance_deg": ParameterValue(
+                            LaunchConfiguration("trajectory_goal_tolerance_deg"),
+                            value_type=float,
+                        ),
+                        "trajectory_stopped_velocity_deg_s": ParameterValue(
+                            LaunchConfiguration(
+                                "trajectory_stopped_velocity_deg_s"
+                            ),
+                            value_type=float,
+                        ),
+                        "trajectory_goal_response_timeout_sec": ParameterValue(
+                            LaunchConfiguration(
+                                "trajectory_goal_response_timeout_sec"
+                            ),
+                            value_type=float,
+                        ),
+                        "trajectory_result_timeout_margin_sec": ParameterValue(
+                            LaunchConfiguration(
+                                "trajectory_result_timeout_margin_sec"
+                            ),
+                            value_type=float,
+                        ),
+                        "trajectory_shutdown_cancel_timeout_sec": ParameterValue(
+                            LaunchConfiguration(
+                                "trajectory_shutdown_cancel_timeout_sec"
+                            ),
                             value_type=float,
                         ),
                     }
