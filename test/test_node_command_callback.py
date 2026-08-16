@@ -64,6 +64,14 @@ class _Future:
         return True
 
 
+class _Publisher:
+    def __init__(self) -> None:
+        self.values: list[float] = []
+
+    def publish(self, message: Any) -> None:
+        self.values.append(message.data)
+
+
 class _GoalHandle:
     accepted = True
 
@@ -117,8 +125,49 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge._active_cancel_future = None
         bridge._active_cancel_requested = False
         bridge._active_cancel_retry_at = None
+        bridge._unity_position_publishers = {}
+        bridge._unity_position_signs = {
+            "swing": -1.0,
+            "boom": 1.0,
+            "arm": 1.0,
+            "bucket": 1.0,
+        }
         bridge.get_logger = lambda: logger
         return bridge, scheduler, logger
+
+    def test_accepted_target_is_published_to_unity_topics(self) -> None:
+        from scratch_hci_bridge.node import ScratchHciBridge
+
+        bridge = ScratchHciBridge.__new__(ScratchHciBridge)
+        publishers = {
+            name: _Publisher() for name in ("swing", "boom", "arm", "bucket")
+        }
+        bridge._unity_position_publishers = publishers
+        bridge._unity_position_signs = {
+            "swing": -1.0,
+            "boom": 1.0,
+            "arm": 1.0,
+            "bucket": 1.0,
+        }
+        bridge.get_logger = lambda: _Logger()
+        scheduled = SimpleNamespace(
+            target=SimpleNamespace(
+                joint_names=(
+                    "swing_joint",
+                    "boom_joint",
+                    "arm_joint",
+                    "bucket_joint",
+                ),
+                positions_rad=(0.1, 0.2, 0.3, 0.4),
+            )
+        )
+
+        bridge._publish_unity_position_target(scheduled)
+
+        self.assertEqual(publishers["swing"].values, [-0.1])
+        self.assertEqual(publishers["boom"].values, [0.2])
+        self.assertEqual(publishers["arm"].values, [0.3])
+        self.assertEqual(publishers["bucket"].values, [0.4])
 
     def test_pid_callback_queues_raw_value_and_captured_speed(self) -> None:
         from scratch_hci_bridge.node import ScratchHciBridge

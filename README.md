@@ -13,7 +13,7 @@ Scratch HCI command block
   -> /tb20e_controller/follow_joint_trajectory
   -> tb20e_control (PID)
   -> /manipulated_<joint>_lever
-  -> Unity
+  -> 実機
 ```
 
 既定設定では`tb20e`を50 Hzで操作します。
@@ -252,6 +252,12 @@ angular.z = (right - left) / 2 * drive_angular_scale
 | `trajectory_goal_response_timeout_sec` | `5.0` | goal応答待ちの警告時間[s]（超過時は状態不明のためキューを閉じたまま保持） |
 | `trajectory_result_timeout_margin_sec` | `35.0` | 指定到達時間を超えてresultを待つ猶予[s]（超過後はcancel要求） |
 | `trajectory_shutdown_cancel_timeout_sec` | `2.0` | ノード終了時にgoal応答・cancel・終端resultを待つ合計上限[s] |
+| `unity_position_output_enabled` | `false` | 受理された4軸目標をUnity用topicにも送る |
+| `unity_position_command_prefix` | `/tb20e` | Unity用位置指令topicのprefix（`/<axis>/cmd`を付加） |
+| `swing_unity_position_sign` | `-1.0` | Unity用swing位置指令の符号（実機座標との変換） |
+| `boom_unity_position_sign` | `1.0` | Unity用boom位置指令の符号 |
+| `arm_unity_position_sign` | `1.0` | Unity用arm位置指令の符号 |
+| `bucket_unity_position_sign` | `1.0` | Unity用bucket位置指令の符号 |
 
 例:
 
@@ -259,6 +265,13 @@ angular.z = (right - left) / 2 * drive_angular_scale
 ros2 launch scratch_hci_bridge scratch_hci_bridge.launch.py \
   excavator:=tb20e http_host:=127.0.0.1 http_port:=8899 publish_hz:=50.0
 ```
+
+`unity_position_output_enabled:=true`の場合、実機側Action serverがgoalを受理した後に、
+同じ目標角度を`/tb20e/{swing,boom,arm,bucket}/cmd`へ
+`std_msgs/msg/Float64`のradでpublishします。実機とUnityをまとめて起動する場合は
+`tb20e_bringup`の`tb20e_real_unity.launch.py`を使用してください。
+topic prefixは先頭に`/`がない指定でも絶対名へ正規化されます。swingはUnityと実機の
+正方向を合わせるため、既定で目標角度の符号を反転します。
 
 HTTPの`200 OK`は命令を内部キューへ保存したことを示し、trajectory goalの受理や完了までは
 保証しません。goalの送信・受理・完了・失敗と実行モードはノードログへ出力します。PID出力topicへ別ノードから同時に

@@ -40,6 +40,16 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "trajectory_shutdown_cancel_timeout_sec", default_value="2.0"
             ),
+            DeclareLaunchArgument(
+                "unity_position_output_enabled", default_value="false"
+            ),
+            DeclareLaunchArgument(
+                "unity_position_command_prefix", default_value="/tb20e"
+            ),
+            DeclareLaunchArgument("swing_unity_position_sign", default_value="-1.0"),
+            DeclareLaunchArgument("boom_unity_position_sign", default_value="1.0"),
+            DeclareLaunchArgument("arm_unity_position_sign", default_value="1.0"),
+            DeclareLaunchArgument("bucket_unity_position_sign", default_value="1.0"),
             Node(
                 package="scratch_hci_bridge",
                 executable="scratch_hci_bridge",
@@ -105,6 +115,29 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration(
                                 "trajectory_shutdown_cancel_timeout_sec"
                             ),
+                            value_type=float,
+                        ),
+                        "unity_position_output_enabled": ParameterValue(
+                            LaunchConfiguration("unity_position_output_enabled"),
+                            value_type=bool,
+                        ),
+                        "unity_position_command_prefix": LaunchConfiguration(
+                            "unity_position_command_prefix"
+                        ),
+                        "swing_unity_position_sign": ParameterValue(
+                            LaunchConfiguration("swing_unity_position_sign"),
+                            value_type=float,
+                        ),
+                        "boom_unity_position_sign": ParameterValue(
+                            LaunchConfiguration("boom_unity_position_sign"),
+                            value_type=float,
+                        ),
+                        "arm_unity_position_sign": ParameterValue(
+                            LaunchConfiguration("arm_unity_position_sign"),
+                            value_type=float,
+                        ),
+                        "bucket_unity_position_sign": ParameterValue(
+                            LaunchConfiguration("bucket_unity_position_sign"),
                             value_type=float,
                         ),
                     }

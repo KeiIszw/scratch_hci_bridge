@@ -64,6 +64,12 @@ class ScratchHciBridge(Node):
         self.declare_parameter("trajectory_goal_response_timeout_sec", 5.0)
         self.declare_parameter("trajectory_result_timeout_margin_sec", 35.0)
         self.declare_parameter("trajectory_shutdown_cancel_timeout_sec", 2.0)
+        self.declare_parameter("unity_position_output_enabled", False)
+        self.declare_parameter("unity_position_command_prefix", "/tb20e")
+        self.declare_parameter("swing_unity_position_sign", -1.0)
+        self.declare_parameter("boom_unity_position_sign", 1.0)
+        self.declare_parameter("arm_unity_position_sign", 1.0)
+        self.declare_parameter("bucket_unity_position_sign", 1.0)
 
         excavator = str(self.get_parameter("excavator").value).strip("/")
         publish_hz = float(self.get_parameter("publish_hz").value)
@@ -105,6 +111,19 @@ class ScratchHciBridge(Node):
         self._trajectory_shutdown_cancel_timeout_sec = float(
             self.get_parameter("trajectory_shutdown_cancel_timeout_sec").value
         )
+        self._unity_position_output_enabled = bool(
+            self.get_parameter("unity_position_output_enabled").value
+        )
+        unity_position_command_prefix_raw = str(
+            self.get_parameter("unity_position_command_prefix").value
+        )
+        unity_position_command_prefix = (
+            "/" + unity_position_command_prefix_raw.strip("/")
+        )
+        self._unity_position_signs = {
+            name: float(self.get_parameter(f"{name}_unity_position_sign").value)
+            for name, _ in PID_JOINTS
+        }
 
         if not excavator:
             raise ValueError("excavator must not be empty")
@@ -188,6 +207,18 @@ class ScratchHciBridge(Node):
                 "trajectory_shutdown_cancel_timeout_sec must be finite and "
                 "non-negative"
             )
+        if (
+            self._unity_position_output_enabled
+            and not unity_position_command_prefix_raw.strip("/")
+        ):
+            raise ValueError(
+                "unity_position_command_prefix must not be empty when output is enabled"
+            )
+        if any(
+            not math.isfinite(sign) or abs(sign) != 1.0
+            for sign in self._unity_position_signs.values()
+        ):
+            raise ValueError("Unity position signs must be either -1 or 1")
 
         self._state = CommandState(
             drive_linear_scale=drive_linear_scale,
@@ -199,6 +230,15 @@ class ScratchHciBridge(Node):
         self._direct_joint_publishers = {
             joint: self.create_publisher(Float64, f"/{excavator}/{joint}/cmd", 10)
             for joint in DIRECT_JOINT_NAMES
+        }
+        self._unity_position_publishers = {
+            http_name: self.create_publisher(
+                Float64,
+                f"{unity_position_command_prefix}/{http_name}/cmd",
+                10,
+            )
+            for http_name, _ in PID_JOINTS
+            if self._unity_position_output_enabled
         }
         self._trajectory_scheduler = TrajectoryScheduler(
             batch_wait_sec=self._trajectory_debounce_sec,
@@ -250,6 +290,11 @@ class ScratchHciBridge(Node):
             f"Sending four-axis PID targets to {trajectory_action} "
             "(default execution mode: serial)"
         )
+        if self._unity_position_output_enabled:
+            self.get_logger().info(
+                "Publishing accepted four-axis targets under "
+                f"{unity_position_command_prefix}/<axis>/cmd"
+            )
 
     def _command_callback(self, command: str, value: float) -> None:
         self.get_logger().info(f"HTTP command: {command}={value:g}")
@@ -380,6 +425,30 @@ class ScratchHciBridge(Node):
             partial(self._goal_response_callback, scheduled=scheduled)
         )
 
+    def _publish_unity_position_target(self, scheduled: ScheduledTrajectory) -> None:
+        if not self._unity_position_publishers:
+            return
+        positions_by_joint = dict(
+            zip(
+                scheduled.target.joint_names,
+                scheduled.target.positions_rad,
+            )
+        )
+        for http_name, ros_name in PID_JOINTS:
+            position_rad = positions_by_joint.get(ros_name)
+            if position_rad is None or not math.isfinite(position_rad):
+                self.get_logger().error(
+                    f"Unity position target is missing or invalid for {ros_name}"
+                )
+                return
+        for http_name, ros_name in PID_JOINTS:
+            message = Float64()
+            message.data = (
+                self._unity_position_signs[http_name]
+                * positions_by_joint[ros_name]
+            )
+            self._unity_position_publishers[http_name].publish(message)
+
     def _goal_response_callback(
         self, future: Any, scheduled: ScheduledTrajectory
     ) -> None:
@@ -418,6 +487,7 @@ class ScratchHciBridge(Node):
         self._active_cancel_future = None
         self._active_cancel_requested = False
         self._active_cancel_retry_at = None
+        self._publish_unity_position_target(scheduled)
         if submission_started_at is None:
             submission_started_at = time.monotonic()
         self._active_goal_deadline = (
