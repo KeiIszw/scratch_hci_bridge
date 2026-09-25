@@ -22,7 +22,7 @@ Scratch HCI command block
 |---|---|
 | 左右クローラ速度 | `/tb20e/tracks/cmd_vel` (`geometry_msgs/msg/Twist`) |
 | `swing`, `boom`, `arm`, `bucket`の絶対・相対角 | `/tb20e_controller/follow_joint_trajectory` (`control_msgs/action/FollowJointTrajectory`, rad) |
-| `blade`, `body`, `thumb`の目標角度 | `/tb20e/<joint>/cmd` (`std_msgs/msg/Float64`, rad) |
+| `blade`, `body`, `thumb`の目標角度 | `/TB20e/<joint>/cmd` (`std_msgs/msg/Float64`, rad) |
 
 ## ビルドと起動
 
@@ -253,7 +253,8 @@ angular.z = (right - left) / 2 * drive_angular_scale
 | `trajectory_result_timeout_margin_sec` | `35.0` | 指定到達時間を超えてresultを待つ猶予[s]（超過後はcancel要求） |
 | `trajectory_shutdown_cancel_timeout_sec` | `2.0` | ノード終了時にgoal応答・cancel・終端resultを待つ合計上限[s] |
 | `unity_position_output_enabled` | `false` | 受理された4軸目標をUnity用topicにも送る |
-| `unity_position_command_prefix` | `/tb20e` | Unity用位置指令topicのprefix（`/<axis>/cmd`を付加） |
+| `unity_position_command_prefix` | `/TB20e` | Unity用位置指令topicのprefix（`/<axis>/cmd`を付加） |
+| `direct_joint_command_prefix` | `/TB20e` | Unity用`blade/body/thumb` topicのprefix |
 | `swing_unity_position_sign` | `-1.0` | Unity用swing位置指令の符号（実機座標との変換） |
 | `boom_unity_position_sign` | `1.0` | Unity用boom位置指令の符号 |
 | `arm_unity_position_sign` | `1.0` | Unity用arm位置指令の符号 |
@@ -267,7 +268,7 @@ ros2 launch scratch_hci_bridge scratch_hci_bridge.launch.py \
 ```
 
 `unity_position_output_enabled:=true`の場合、実機側Action serverがgoalを受理した後に、
-同じ目標角度を`/tb20e/{swing,boom,arm,bucket}/cmd`へ
+同じ目標角度を`/TB20e/{swing,boom,arm,bucket}/cmd`へ
 `std_msgs/msg/Float64`のradでpublishします。実機とUnityをまとめて起動する場合は
 `tb20e_bringup`の`tb20e_real_unity.launch.py`を使用してください。
 topic prefixは先頭に`/`がない指定でも絶対名へ正規化されます。swingはUnityと実機の

@@ -44,7 +44,10 @@ def generate_launch_description() -> LaunchDescription:
                 "unity_position_output_enabled", default_value="false"
             ),
             DeclareLaunchArgument(
-                "unity_position_command_prefix", default_value="/tb20e"
+                "unity_position_command_prefix", default_value="/TB20e"
+            ),
+            DeclareLaunchArgument(
+                "direct_joint_command_prefix", default_value="/TB20e"
             ),
             DeclareLaunchArgument("swing_unity_position_sign", default_value="-1.0"),
             DeclareLaunchArgument("boom_unity_position_sign", default_value="1.0"),
@@ -123,6 +126,9 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "unity_position_command_prefix": LaunchConfiguration(
                             "unity_position_command_prefix"
+                        ),
+                        "direct_joint_command_prefix": LaunchConfiguration(
+                            "direct_joint_command_prefix"
                         ),
                         "swing_unity_position_sign": ParameterValue(
                             LaunchConfiguration("swing_unity_position_sign"),

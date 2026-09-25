@@ -65,7 +65,8 @@ class ScratchHciBridge(Node):
         self.declare_parameter("trajectory_result_timeout_margin_sec", 35.0)
         self.declare_parameter("trajectory_shutdown_cancel_timeout_sec", 2.0)
         self.declare_parameter("unity_position_output_enabled", False)
-        self.declare_parameter("unity_position_command_prefix", "/tb20e")
+        self.declare_parameter("unity_position_command_prefix", "/TB20e")
+        self.declare_parameter("direct_joint_command_prefix", "/TB20e")
         self.declare_parameter("swing_unity_position_sign", -1.0)
         self.declare_parameter("boom_unity_position_sign", 1.0)
         self.declare_parameter("arm_unity_position_sign", 1.0)
@@ -119,6 +120,12 @@ class ScratchHciBridge(Node):
         )
         unity_position_command_prefix = (
             "/" + unity_position_command_prefix_raw.strip("/")
+        )
+        direct_joint_command_prefix_raw = str(
+            self.get_parameter("direct_joint_command_prefix").value
+        )
+        direct_joint_command_prefix = (
+            "/" + direct_joint_command_prefix_raw.strip("/")
         )
         self._unity_position_signs = {
             name: float(self.get_parameter(f"{name}_unity_position_sign").value)
@@ -214,6 +221,8 @@ class ScratchHciBridge(Node):
             raise ValueError(
                 "unity_position_command_prefix must not be empty when output is enabled"
             )
+        if not direct_joint_command_prefix_raw.strip("/"):
+            raise ValueError("direct_joint_command_prefix must not be empty")
         if any(
             not math.isfinite(sign) or abs(sign) != 1.0
             for sign in self._unity_position_signs.values()
@@ -228,7 +237,9 @@ class ScratchHciBridge(Node):
             Twist, f"/{excavator}/tracks/cmd_vel", 10
         )
         self._direct_joint_publishers = {
-            joint: self.create_publisher(Float64, f"/{excavator}/{joint}/cmd", 10)
+            joint: self.create_publisher(
+                Float64, f"{direct_joint_command_prefix}/{joint}/cmd", 10
+            )
             for joint in DIRECT_JOINT_NAMES
         }
         self._unity_position_publishers = {
@@ -284,7 +295,8 @@ class ScratchHciBridge(Node):
             f"Scratch HCI HTTP server listening on {http_host or '0.0.0.0'}:{http_port}"
         )
         self.get_logger().info(
-            f"Publishing drive/direct commands under /{excavator} at {publish_hz:g} Hz"
+            f"Publishing drive commands under /{excavator} and direct joint "
+            f"commands under {direct_joint_command_prefix} at {publish_hz:g} Hz"
         )
         self.get_logger().info(
             f"Sending four-axis PID targets to {trajectory_action} "
