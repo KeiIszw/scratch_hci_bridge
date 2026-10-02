@@ -11,6 +11,7 @@ from decimal import Decimal
 from scratch_hci_bridge.command_state import (
     ExecutionMode,
     JOINT_LIMITS_DEG,
+    ABSOLUTE_JOINT_COMMANDS,
     RELATIVE_JOINT_COMMANDS,
     is_safe_relative_swing_command,
     is_ros_duration_safe,
@@ -156,8 +157,9 @@ class TrajectoryScheduler:
         now: float | None = None,
     ) -> bool:
         relative_command = RELATIVE_JOINT_COMMANDS.get(command)
-        if command in PID_HTTP_TO_ROS:
-            joint_name = command
+        absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
+        if absolute_joint in PID_HTTP_TO_ROS:
+            joint_name = absolute_joint
             queued_degrees = degrees
             relative = False
         elif (
@@ -385,7 +387,8 @@ class TrajectoryScheduler:
         return True
 
     def mark_completed(
-        self, scheduled: ScheduledTrajectory, *, successful: bool
+        self, scheduled: ScheduledTrajectory, *, successful: bool,
+        preserve_queued: bool = False,
     ) -> bool:
         with self._lock:
             if (
@@ -394,7 +397,7 @@ class TrajectoryScheduler:
             ):
                 return False
 
-            if not successful:
+            if not successful and not preserve_queued:
                 # A serial successor must never run after its predecessor failed.
                 # Drop queued work but retain the selected mode so a later HTTP
                 # command can start a fresh batch without restarting the node.
@@ -417,11 +420,12 @@ class TrajectoryScheduler:
             commanded_joint_names = {
                 command.joint_name for command in scheduled.commands
             }
-            for (http_name, _), target_position, feedback_revision in zip(
+            for (http_name, _), target_position, feedback_revision in (zip(
                 PID_JOINTS,
                 scheduled.target.positions_rad,
                 scheduled.feedback_revisions,
-            ):
+            ) if successful else ()):
+                # Failed goals must retain measured positions for successors.
                 # The action result can be delivered before the corresponding
                 # JointState callback. Seed the hold position from the successful
                 # full goal only when no newer physical feedback was received.

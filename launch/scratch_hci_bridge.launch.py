@@ -19,6 +19,10 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/tb20e_controller/follow_joint_trajectory",
             ),
             DeclareLaunchArgument("joint_state_topic", default_value="/joint_states"),
+            *[
+                DeclareLaunchArgument(f"{joint}_default_speed_deg_s", default_value="0.0")
+                for joint in ("swing", "boom", "arm", "bucket")
+            ],
             DeclareLaunchArgument("trajectory_duration_sec", default_value="3.0"),
             DeclareLaunchArgument("trajectory_debounce_sec", default_value="0.5"),
             DeclareLaunchArgument(
@@ -49,6 +53,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "direct_joint_command_prefix", default_value="/TB20e"
             ),
+            DeclareLaunchArgument("active_axis_mask_topic", default_value=""),
             DeclareLaunchArgument("swing_unity_position_sign", default_value="-1.0"),
             DeclareLaunchArgument("boom_unity_position_sign", default_value="1.0"),
             DeclareLaunchArgument("arm_unity_position_sign", default_value="1.0"),
@@ -76,6 +81,13 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "trajectory_action": LaunchConfiguration("trajectory_action"),
                         "joint_state_topic": LaunchConfiguration("joint_state_topic"),
+                        **{
+                            f"{joint}_default_speed_deg_s": ParameterValue(
+                                LaunchConfiguration(f"{joint}_default_speed_deg_s"),
+                                value_type=float,
+                            )
+                            for joint in ("swing", "boom", "arm", "bucket")
+                        },
                         "trajectory_duration_sec": ParameterValue(
                             LaunchConfiguration("trajectory_duration_sec"),
                             value_type=float,
@@ -129,6 +141,9 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "direct_joint_command_prefix": LaunchConfiguration(
                             "direct_joint_command_prefix"
+                        ),
+                        "active_axis_mask_topic": LaunchConfiguration(
+                            "active_axis_mask_topic"
                         ),
                         "swing_unity_position_sign": ParameterValue(
                             LaunchConfiguration("swing_unity_position_sign"),

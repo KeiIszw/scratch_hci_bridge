@@ -13,27 +13,51 @@ from scratch_hci_bridge.command_state import (
 
 
 class CommandStateTest(unittest.TestCase):
+    def test_all_absolute_commands_require_angle_suffix(self) -> None:
+        state = CommandState()
+        for joint in JOINT_NAMES:
+            with self.subTest(joint=joint):
+                self.assertFalse(state.apply_command(joint, 40.0))
+                self.assertTrue(state.apply_command(f"{joint}_angle", 40.0))
+                self.assertNotIn(joint, SUPPORTED_COMMANDS)
+                self.assertIn(f"{joint}_angle", SUPPORTED_COMMANDS)
+
+    def test_default_speeds_can_be_overridden_by_http_commands(self) -> None:
+        state = CommandState(default_joint_speeds_deg_s={"boom": 5.0, "arm": 2.0})
+        self.assertEqual(state.snapshot().joint_speed_limits_deg_s["boom"], 5.0)
+        self.assertEqual(state.snapshot().joint_speed_limits_deg_s["arm"], 2.0)
+        self.assertIsNone(state.snapshot().joint_speed_limits_deg_s["swing"])
+        self.assertTrue(state.apply_command("boom_speed", 8.0))
+        self.assertEqual(state.snapshot().joint_speed_limits_deg_s["boom"], 8.0)
+        self.assertTrue(state.apply_command("boom_speed", 0.0))
+        self.assertIsNone(state.snapshot().joint_speed_limits_deg_s["boom"])
+
+    def test_invalid_default_speeds_are_rejected(self) -> None:
+        for speed in (-1.0, math.nan, math.inf, 1e-300):
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                CommandState(default_joint_speeds_deg_s={"boom": speed})
+
     def test_joint_command_sets_absolute_angle_and_is_limited(self) -> None:
         state = CommandState()
 
-        self.assertTrue(state.apply_command("boom", -30.0))
+        self.assertTrue(state.apply_command("boom_angle", -30.0))
         self.assertEqual(state.next_frame().joints_deg["boom"], -30.0)
 
-        self.assertTrue(state.apply_command("boom", 1000.0))
+        self.assertTrue(state.apply_command("boom_angle", 1000.0))
         self.assertEqual(state.next_frame().joints_deg["boom"], 48.0)
 
     def test_body_is_not_angle_limited(self) -> None:
         state = CommandState()
 
-        self.assertTrue(state.apply_command("body", 720.0))
+        self.assertTrue(state.apply_command("body_angle", 720.0))
         self.assertEqual(state.next_frame().joints_deg["body"], 720.0)
 
     def test_swing_uses_tb20e_continuous_angle_range(self) -> None:
         state = CommandState()
 
-        self.assertTrue(state.apply_command("swing", 270.0))
+        self.assertTrue(state.apply_command("swing_angle", 270.0))
         self.assertEqual(state.next_frame().joints_deg["swing"], 180.0)
-        self.assertTrue(state.apply_command("swing", -270.0))
+        self.assertTrue(state.apply_command("swing_angle", -270.0))
         self.assertEqual(state.next_frame().joints_deg["swing"], -180.0)
 
     def test_crawler_speeds_are_converted_to_twist(self) -> None:
@@ -58,8 +82,8 @@ class CommandStateTest(unittest.TestCase):
         self.assertFalse(state.apply_command("boom_speed", -1.0))
         self.assertFalse(state.apply_command("boom_speed", 5e-324))
         self.assertFalse(state.apply_command("boom_speed", 1e-100))
-        self.assertFalse(state.apply_command("boom", float("nan")))
-        self.assertFalse(state.apply_command("boom", float("inf")))
+        self.assertFalse(state.apply_command("boom_angle", float("nan")))
+        self.assertFalse(state.apply_command("boom_angle", float("inf")))
 
     def test_pid_joint_speed_limit_can_be_set_and_disabled(self) -> None:
         state = CommandState()
@@ -125,7 +149,7 @@ class CommandStateTest(unittest.TestCase):
         )
         self.assertEqual(JOINT_NAMES, expected_joints)
         expected_commands = {
-            *expected_joints,
+            *(f"{joint}_angle" for joint in expected_joints),
             "swing_speed",
             "boom_speed",
             "arm_speed",
@@ -155,7 +179,7 @@ class CommandStateTest(unittest.TestCase):
             "thumb": 7.0,
         }
         for joint, angle in joint_commands.items():
-            self.assertTrue(state.apply_command(joint, angle))
+            self.assertTrue(state.apply_command(f"{joint}_angle", angle))
         self.assertTrue(state.apply_command("left_crawler_speed", -0.5))
         self.assertTrue(state.apply_command("right_crawler_speed", 0.5))
 

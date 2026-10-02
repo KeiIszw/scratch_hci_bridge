@@ -104,11 +104,24 @@ class HttpServerTest(unittest.TestCase):
 
         try:
             self.assertEqual(
-                _get(f"{base_url}?type=command&cmd=boom&val=-30"),
+                _get(f"{base_url}?type=command&cmd=boom_angle&val=-30"),
                 (200, "OK", "*"),
             )
             self.assertEqual(state.snapshot().joints_deg["boom"], -30.0)
-            self.assertEqual(received, [("boom", -30.0)])
+            self.assertEqual(received, [("boom_angle", -30.0)])
+            for joint in ("blade", "body", "swing", "boom", "arm", "bucket", "thumb"):
+                with self.subTest(joint=joint):
+                    self.assertEqual(
+                        _get(f"{base_url}?type=command&cmd={joint}_angle&val=40")[0],
+                        200,
+                    )
+                    self.assertEqual(received[-1], (f"{joint}_angle", 40.0))
+                    self.assertEqual(
+                        _get(f"{base_url}?type=command&cmd={joint}&val=40")[0],
+                        400,
+                    )
+            _get(f"{base_url}?type=command&cmd=boom_angle&val=-30")
+
 
             self.assertEqual(
                 _get(f"{base_url}?type=command&cmd=boom_up&val=-10"),
@@ -177,11 +190,11 @@ class HttpServerTest(unittest.TestCase):
                 (400, "joint speed would exceed ROS Duration range"),
             )
 
-            result = _get(f"{base_url}?type=reporter&cmd=boom&val=0")
+            result = _get(f"{base_url}?type=reporter&cmd=boom_angle&val=0")
             self.assertEqual(result, (400, "type=command is required", "*"))
 
             status, body, _ = _get(
-                f"{base_url}?type=command&cmd=boom&val=nan"
+                f"{base_url}?type=command&cmd=boom_angle&val=nan"
             )
             self.assertEqual((status, body), (400, "val must be a finite number"))
 
@@ -208,18 +221,18 @@ class HttpServerTest(unittest.TestCase):
             )
             self.assertEqual((status, body), (400, "unknown cmd: base_left"))
 
-            status, body, _ = _get(f"{base_url}?type=command&cmd=boom")
+            status, body, _ = _get(f"{base_url}?type=command&cmd=boom_angle")
             self.assertEqual((status, body), (400, "cmd and val are required"))
 
             status, body, _ = _get(
-                f"{base_url}?type=command&cmd=boom&val=48&val=-83"
+                f"{base_url}?type=command&cmd=boom_angle&val=48&val=-83"
             )
             self.assertEqual(
                 (status, body), (400, "cmd and val must appear once")
             )
 
             status, body, _ = _get(
-                f"{base_url}?type=command&cmd=boom&val=1&extra=value"
+                f"{base_url}?type=command&cmd=boom_angle&val=1&extra=value"
             )
             self.assertEqual(
                 (status, body),

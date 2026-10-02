@@ -7,6 +7,7 @@ from enum import Enum
 
 
 JOINT_NAMES = ("blade", "body", "swing", "boom", "arm", "bucket", "thumb")
+ABSOLUTE_JOINT_COMMANDS = {f"{joint}_angle": joint for joint in JOINT_NAMES}
 PID_JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 JOINT_SPEED_COMMANDS = {
     f"{joint}_speed": joint for joint in PID_JOINT_NAMES
@@ -69,7 +70,7 @@ JOINT_LIMITS_DEG = {
 }
 
 SUPPORTED_COMMANDS = (
-    frozenset(JOINT_NAMES)
+    frozenset(ABSOLUTE_JOINT_COMMANDS)
     | frozenset(JOINT_SPEED_COMMANDS)
     | frozenset(EXECUTION_MODE_COMMANDS)
     | frozenset(RELATIVE_JOINT_COMMANDS)
@@ -100,6 +101,7 @@ class CommandState:
         self,
         drive_linear_scale: float = 1.0,
         drive_angular_scale: float = 1.0,
+        default_joint_speeds_deg_s: dict[str, float] | None = None,
     ) -> None:
         if not all(
             math.isfinite(value)
@@ -109,9 +111,15 @@ class CommandState:
 
         self._lock = threading.Lock()
         self._joints_deg = dict(INITIAL_JOINT_DEG)
-        self._joint_speed_limits_deg_s = {
-            joint: None for joint in PID_JOINT_NAMES
-        }
+        defaults = default_joint_speeds_deg_s or {}
+        self._joint_speed_limits_deg_s = {}
+        for joint in PID_JOINT_NAMES:
+            speed = defaults.get(joint, 0.0)
+            if not math.isfinite(speed) or speed < 0.0 or (
+                speed > 0.0 and not is_safe_pid_speed_limit(speed)
+            ):
+                raise ValueError(f"{joint} default speed must be non-negative and fit ROS Duration")
+            self._joint_speed_limits_deg_s[joint] = speed if speed > 0.0 else None
         self._execution_mode = ExecutionMode.SERIAL
         self._left_crawler_speed = 0.0
         self._right_crawler_speed = 0.0
@@ -122,8 +130,9 @@ class CommandState:
         if not math.isfinite(value):
             return False
         with self._lock:
-            if command in self._joints_deg:
-                self._joints_deg[command] = _clamp_joint(command, value)
+            joint = ABSOLUTE_JOINT_COMMANDS.get(command)
+            if joint is not None:
+                self._joints_deg[joint] = _clamp_joint(joint, value)
                 return True
             if command in RELATIVE_JOINT_COMMANDS:
                 # Relative PID targets are resolved from fresh joint feedback by

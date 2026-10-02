@@ -39,8 +39,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
             initial_mode_command_wait_sec=0.5,
         )
         _feedback(scheduler)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
-        scheduler.update_http_target("arm", 32.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.01)
 
         self.assertEqual(
             scheduler.selected_execution_mode, ExecutionMode.SERIAL
@@ -52,7 +52,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert boom_goal is not None
         self.assertEqual(boom_goal.execution_mode, ExecutionMode.SERIAL)
         self.assertEqual(
-            tuple(command.http_name for command in boom_goal.commands), ("boom",)
+            tuple(command.http_name for command in boom_goal.commands), ("boom_angle",)
         )
         self.assertTrue(
             math.isclose(
@@ -74,7 +74,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(arm_goal)
         assert arm_goal is not None
         self.assertEqual(
-            tuple(command.http_name for command in arm_goal.commands), ("arm",)
+            tuple(command.http_name for command in arm_goal.commands), ("arm_angle",)
         )
         self.assertTrue(
             math.isclose(
@@ -89,8 +89,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler)
         self.assertTrue(scheduler.set_execution_mode(ExecutionMode.PARALLEL, now=0.0))
-        scheduler.update_http_target("boom", -50.0, now=1.0)
-        scheduler.update_http_target("arm", 32.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.01)
 
         self.assertIsNone(scheduler.pending_snapshot(now=1.059))
         goal = scheduler.pending_snapshot(now=1.061)
@@ -100,11 +100,11 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertEqual(goal.execution_mode, ExecutionMode.PARALLEL)
         self.assertEqual(
             tuple(command.http_name for command in goal.commands),
-            ("boom", "arm"),
+            ("boom_angle", "arm_angle"),
         )
         self.assertEqual(
             tuple(target.http_name for target in goal.target.pending_http_targets),
-            ("boom", "arm"),
+            ("boom_angle", "arm_angle"),
         )
         self.assertTrue(
             math.isclose(goal.target.positions_rad[1], math.radians(-50.0))
@@ -117,16 +117,16 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=10.0)
         _feedback(scheduler)
         scheduler.set_execution_mode("parallel", now=0.0)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
         scheduler.set_execution_mode("serial", now=1.01)
-        scheduler.update_http_target("arm", 32.0, now=1.02)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.02)
         scheduler.set_execution_mode("parallel", now=1.03)
 
         first = scheduler.pending_snapshot(now=1.03)
         self.assertIsNotNone(first)
         assert first is not None
         self.assertEqual(first.execution_mode, ExecutionMode.PARALLEL)
-        self.assertEqual(first.commands[0].http_name, "boom")
+        self.assertEqual(first.commands[0].http_name, "boom_angle")
         self.assertTrue(scheduler.mark_submitted(first))
         _feedback(scheduler, boom=-50.0)
         self.assertTrue(scheduler.mark_completed(first, successful=True))
@@ -135,7 +135,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertEqual(second.execution_mode, ExecutionMode.SERIAL)
-        self.assertEqual(second.commands[0].http_name, "arm")
+        self.assertEqual(second.commands[0].http_name, "arm_angle")
         self.assertEqual(
             scheduler.selected_execution_mode, ExecutionMode.PARALLEL
         )
@@ -146,8 +146,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
             initial_mode_command_wait_sec=0.5,
         )
         _feedback(scheduler)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
-        scheduler.update_http_target("arm", 32.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.01)
 
         scheduler.set_execution_mode("parallel", now=1.02)
         self.assertIsNone(scheduler.pending_snapshot(now=1.069))
@@ -166,9 +166,9 @@ class TrajectorySchedulerTest(unittest.TestCase):
         _feedback(scheduler)
         # Model an older non-awaiting HCI build where the first mode request
         # reaches the server between the two motion requests.
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
         scheduler.set_execution_mode("parallel", now=1.01)
-        scheduler.update_http_target("arm", 32.0, now=1.02)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.02)
 
         goal = scheduler.pending_snapshot(now=1.071)
 
@@ -177,7 +177,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertEqual(goal.execution_mode, ExecutionMode.PARALLEL)
         self.assertEqual(
             tuple(command.http_name for command in goal.commands),
-            ("boom", "arm"),
+            ("boom_angle", "arm_angle"),
         )
 
     def test_late_parallel_mode_partitions_accumulated_swing_commands(self) -> None:
@@ -218,7 +218,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             initial_mode_command_wait_sec=0.5,
         )
         _feedback(scheduler)
-        scheduler.update_http_target("boom", -60.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -60.0, now=1.0)
         first = scheduler.pending_snapshot(now=1.501)
         self.assertIsNotNone(first)
         assert first is not None
@@ -226,7 +226,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertTrue(scheduler.mark_submitted(first))
         self.assertTrue(scheduler.mark_completed(first, successful=True))
 
-        scheduler.update_http_target("boom", -50.0, now=2.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=2.0)
         scheduler.set_execution_mode("parallel", now=2.01)
         second = scheduler.pending_snapshot(now=2.01)
 
@@ -243,7 +243,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             initial_mode_command_wait_sec=0.5,
         )
         _feedback(scheduler)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
 
         scheduler.set_execution_mode("parallel", now=1.501)
         goal = scheduler.pending_snapshot(now=1.501)
@@ -259,8 +259,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler)
         scheduler.set_execution_mode("serial", now=0.0)
-        scheduler.update_http_target("boom", -60.0, now=1.0)
-        scheduler.update_http_target("boom", -40.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -60.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -40.0, now=1.01)
 
         first = scheduler.pending_snapshot(now=1.061)
         self.assertIsNotNone(first)
@@ -282,8 +282,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler)
         scheduler.set_execution_mode("parallel", now=0.0)
-        scheduler.update_http_target("boom", -60.0, now=1.0)
-        scheduler.update_http_target("boom", -40.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -60.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -40.0, now=1.01)
 
         goal = scheduler.pending_snapshot(now=1.061)
 
@@ -536,7 +536,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         _feedback(scheduler, boom=-80.0)
         scheduler.set_execution_mode("parallel", now=0.0)
         scheduler.update_http_target("boom_up", 10.0, now=1.0)
-        scheduler.update_http_target("boom", -50.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.01)
         scheduler.update_http_target("boom_down", 3.0, now=1.02)
 
         goal = scheduler.pending_snapshot(now=1.071)
@@ -551,7 +551,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler, boom=-80.0)
         scheduler.set_execution_mode("parallel", now=0.0)
-        scheduler.update_http_target("boom", 100.0, now=1.0)
+        scheduler.update_http_target("boom_angle", 100.0, now=1.0)
         scheduler.update_http_target("boom_down", 20.0, now=1.01)
 
         goal = scheduler.pending_snapshot(now=1.061)
@@ -566,7 +566,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler, swing=0.0)
         scheduler.set_execution_mode("serial", now=0.0)
-        scheduler.update_http_target("swing", 270.0, now=1.0)
+        scheduler.update_http_target("swing_angle", 270.0, now=1.0)
 
         goal = scheduler.pending_snapshot(now=1.051)
 
@@ -655,7 +655,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         _feedback(scheduler, swing=170.0)
         scheduler.set_execution_mode("parallel", now=0.0)
         self.assertTrue(
-            scheduler.update_http_target("swing", -170.0, now=1.0)
+            scheduler.update_http_target("swing_angle", -170.0, now=1.0)
         )
         self.assertTrue(
             scheduler.update_http_target("swing_left", 30.0, now=1.01)
@@ -858,12 +858,34 @@ class TrajectorySchedulerTest(unittest.TestCase):
             math.isclose(successor.target.positions_rad[2], math.radians(100.0))
         )
 
+    def test_tolerance_failure_keeps_successors_and_measured_position(self) -> None:
+        for mode in ("serial", "parallel"):
+            with self.subTest(mode=mode):
+                scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
+                _feedback(scheduler)
+                scheduler.set_execution_mode(mode, now=0.0)
+                scheduler.update_http_target("boom_angle", -50.0, now=1.0)
+                first = scheduler.pending_snapshot(now=1.06)
+                self.assertIsNotNone(first)
+                self.assertTrue(scheduler.mark_submitted(first))
+                scheduler.update_http_target("boom_up", 10.0, now=1.1)
+                _feedback(scheduler, boom=-70.0)
+                self.assertTrue(scheduler.mark_completed(
+                    first, successful=False, preserve_queued=True,
+                ))
+                self.assertEqual(scheduler.queued_command_count(), 1)
+                successor = scheduler.pending_snapshot(now=1.16)
+                self.assertIsNotNone(successor)
+                self.assertAlmostEqual(
+                    successor.target.positions_rad[1], math.radians(-80.0),
+                )
+
     def test_failed_goal_discards_successors_but_keeps_selected_mode(self) -> None:
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler)
         scheduler.set_execution_mode("serial", now=0.0)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
-        scheduler.update_http_target("arm", 32.0, now=1.01)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
+        scheduler.update_http_target("arm_angle", 32.0, now=1.01)
         goal = scheduler.pending_snapshot(now=1.061)
         self.assertIsNotNone(goal)
         assert goal is not None
@@ -881,7 +903,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler)
         scheduler.set_execution_mode("serial", now=0.0)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
         first = scheduler.pending_snapshot(now=1.051)
         self.assertIsNotNone(first)
         assert first is not None
@@ -898,7 +920,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
     def test_goal_waits_for_all_joint_feedback(self) -> None:
         scheduler = TrajectoryScheduler(batch_wait_sec=0.0)
         scheduler.set_execution_mode("serial", now=0.0)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
 
         self.assertIsNone(scheduler.pending_snapshot(now=1.0))
         self.assertEqual(
@@ -956,10 +978,10 @@ class TrajectorySchedulerTest(unittest.TestCase):
         _feedback(scheduler, boom=-80.0, arm=140.0)
         scheduler.set_execution_mode("parallel", now=0.0)
         scheduler.update_http_target(
-            "boom", -70.0, speed_limit_deg_s=10.0, now=1.0
+            "boom_angle", -70.0, speed_limit_deg_s=10.0, now=1.0
         )
         scheduler.update_http_target(
-            "arm", 100.0, speed_limit_deg_s=5.0, now=1.01
+            "arm_angle", 100.0, speed_limit_deg_s=5.0, now=1.01
         )
 
         goal = scheduler.pending_snapshot(
@@ -976,7 +998,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         _feedback(scheduler, boom=-80.0)
         scheduler.set_execution_mode("serial", now=0.0)
         scheduler.update_http_target(
-            "boom", -50.0, speed_limit_deg_s=5.0, now=1.0
+            "boom_angle", -50.0, speed_limit_deg_s=5.0, now=1.0
         )
 
         goal = scheduler.pending_snapshot(now=1.051)
@@ -998,27 +1020,27 @@ class TrajectorySchedulerTest(unittest.TestCase):
 
         scheduler = TrajectoryScheduler()
         self.assertFalse(scheduler.set_execution_mode("invalid"))
-        self.assertFalse(scheduler.update_http_target("blade", 1.0))
+        self.assertFalse(scheduler.update_http_target("blade_angle", 1.0))
         self.assertFalse(scheduler.update_http_target("swing_left", 180.0))
         self.assertFalse(scheduler.update_http_target("end_dump", 1.0))
-        self.assertFalse(scheduler.update_http_target("boom", float("nan")))
+        self.assertFalse(scheduler.update_http_target("boom_angle", float("nan")))
         self.assertFalse(
             scheduler.update_http_target(
-                "boom", -50.0, speed_limit_deg_s=0.0
+                "boom_angle", -50.0, speed_limit_deg_s=0.0
             )
         )
         self.assertFalse(
             scheduler.update_http_target(
-                "boom", -50.0, speed_limit_deg_s=5e-324
+                "boom_angle", -50.0, speed_limit_deg_s=5e-324
             )
         )
         self.assertFalse(
             scheduler.update_http_target(
-                "boom", -50.0, speed_limit_deg_s=1e-100
+                "boom_angle", -50.0, speed_limit_deg_s=1e-100
             )
         )
         _feedback(scheduler)
-        scheduler.update_http_target("boom", -50.0, now=1.0)
+        scheduler.update_http_target("boom_angle", -50.0, now=1.0)
         with self.assertRaises(ValueError):
             scheduler.pending_snapshot(
                 base_duration_sec=MAX_ROS_DURATION_SEC + 1.0,

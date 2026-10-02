@@ -7,6 +7,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 
+from scratch_hci_bridge.command_state import ABSOLUTE_JOINT_COMMANDS
+
+
 PID_JOINTS = (
     ("swing", "swing_joint"),
     ("boom", "boom_joint"),
@@ -46,13 +49,14 @@ class TrajectoryTargets:
     def update_http_target(
         self, command: str, degrees: float, now: float | None = None
     ) -> bool:
-        if command not in PID_HTTP_TO_ROS or not math.isfinite(degrees):
+        joint = ABSOLUTE_JOINT_COMMANDS.get(command)
+        if joint not in PID_HTTP_TO_ROS or not math.isfinite(degrees):
             return False
 
         with self._lock:
             self._revision += 1
-            self._pending_targets[command] = PendingHttpTarget(
-                http_name=command,
+            self._pending_targets[joint] = PendingHttpTarget(
+                http_name=joint,
                 degrees=degrees,
                 revision=self._revision,
             )

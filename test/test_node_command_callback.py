@@ -41,7 +41,10 @@ class _Scheduler:
         self.send_failures.append(scheduled)
         return True
 
-    def mark_completed(self, scheduled: Any, *, successful: bool) -> bool:
+    def mark_completed(
+        self, scheduled: Any, *, successful: bool, preserve_queued: bool = False
+    ) -> bool:
+        self.preserve_queued = preserve_queued
         self.completions.append((scheduled, successful))
         return True
 
@@ -169,19 +172,38 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertEqual(publishers["arm"].values, [0.3])
         self.assertEqual(publishers["bucket"].values, [0.4])
 
+    def test_active_axis_mask_contains_only_scheduled_joints(self) -> None:
+        from scratch_hci_bridge.node import ScratchHciBridge
+
+        bridge = ScratchHciBridge.__new__(ScratchHciBridge)
+        publisher = _Publisher()
+        bridge._active_axis_mask_publisher = publisher
+        scheduled = SimpleNamespace(
+            commands=(
+                SimpleNamespace(joint_name="boom"),
+                SimpleNamespace(joint_name="bucket"),
+                SimpleNamespace(joint_name="boom"),
+            )
+        )
+
+        bridge._publish_active_axis_mask(scheduled)
+        bridge._publish_active_axis_mask()
+
+        self.assertEqual(publisher.values, [0b1010, 0])
+
     def test_pid_callback_queues_raw_value_and_captured_speed(self) -> None:
         from scratch_hci_bridge.node import ScratchHciBridge
 
         state = CommandState()
         self.assertTrue(state.apply_command("boom_speed", 5.0))
-        self.assertTrue(state.apply_command("boom", 100.0))
+        self.assertTrue(state.apply_command("boom_angle", 100.0))
         scheduler = _Scheduler()
         bridge = ScratchHciBridge.__new__(ScratchHciBridge)
         bridge._state = state
         bridge._trajectory_scheduler = scheduler
         bridge.get_logger = lambda: _Logger()
 
-        bridge._command_callback("boom", 100.0)
+        bridge._command_callback("boom_angle", 100.0)
         self.assertTrue(state.apply_command("boom_up", -10.0))
         bridge._command_callback("boom_up", -10.0)
         self.assertTrue(state.apply_command("swing_speed", 4.0))
@@ -195,7 +217,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertEqual(
             scheduler.targets,
             [
-                ("boom", 100.0, 5.0),
+                ("boom_angle", 100.0, 5.0),
                 ("boom_up", -10.0, 5.0),
                 ("swing_left", -30.0, 4.0),
             ],
@@ -220,6 +242,23 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertEqual(goal_handle.cancel_calls, 1)
         self.assertEqual(scheduler.completions, [])
         self.assertEqual(scheduler.send_failures, [])
+
+    def test_goal_tolerance_failure_preserves_queue_and_releases_gate(self) -> None:
+        bridge, scheduler, logger = self._bridge()
+        scheduled = SimpleNamespace(execution_mode=SimpleNamespace(value="serial"))
+        future = _Future(SimpleNamespace(
+            status=6,
+            result=SimpleNamespace(error_code=-5, error_string="goal_time_tolerance"),
+        ))
+        bridge._active_goal_scheduled = scheduled
+        bridge._goal_result_future = future
+
+        bridge._goal_result_callback(future, scheduled)
+
+        self.assertEqual(scheduler.completions, [(scheduled, False)])
+        self.assertTrue(scheduler.preserve_queued)
+        self.assertIsNone(bridge._active_goal_scheduled)
+        self.assertIn("continuing queued", logger.error_messages[-1])
 
     def test_result_response_exception_cancels_without_releasing_gate(self) -> None:
         bridge, scheduler, _logger = self._bridge()

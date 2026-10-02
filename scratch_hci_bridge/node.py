@@ -15,13 +15,15 @@ from geometry_msgs.msg import Twist
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, UInt8
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from scratch_hci_bridge.command_state import (
     EXECUTION_MODE_COMMANDS,
+    ABSOLUTE_JOINT_COMMANDS,
     RELATIVE_JOINT_COMMANDS,
     CommandState,
     JOINT_NAMES,
@@ -55,6 +57,8 @@ class ScratchHciBridge(Node):
             "trajectory_action", "/tb20e_controller/follow_joint_trajectory"
         )
         self.declare_parameter("joint_state_topic", "/joint_states")
+        for joint in ("swing", "boom", "arm", "bucket"):
+            self.declare_parameter(f"{joint}_default_speed_deg_s", 0.0)
         self.declare_parameter("trajectory_duration_sec", 3.0)
         self.declare_parameter("trajectory_debounce_sec", 0.5)
         self.declare_parameter("initial_mode_command_wait_sec", 0.5)
@@ -67,6 +71,7 @@ class ScratchHciBridge(Node):
         self.declare_parameter("unity_position_output_enabled", False)
         self.declare_parameter("unity_position_command_prefix", "/TB20e")
         self.declare_parameter("direct_joint_command_prefix", "/TB20e")
+        self.declare_parameter("active_axis_mask_topic", "")
         self.declare_parameter("swing_unity_position_sign", -1.0)
         self.declare_parameter("boom_unity_position_sign", 1.0)
         self.declare_parameter("arm_unity_position_sign", 1.0)
@@ -126,6 +131,9 @@ class ScratchHciBridge(Node):
         )
         direct_joint_command_prefix = (
             "/" + direct_joint_command_prefix_raw.strip("/")
+        )
+        active_axis_mask_topic = str(
+            self.get_parameter("active_axis_mask_topic").value
         )
         self._unity_position_signs = {
             name: float(self.get_parameter(f"{name}_unity_position_sign").value)
@@ -232,6 +240,10 @@ class ScratchHciBridge(Node):
         self._state = CommandState(
             drive_linear_scale=drive_linear_scale,
             drive_angular_scale=drive_angular_scale,
+            default_joint_speeds_deg_s={
+                joint: float(self.get_parameter(f"{joint}_default_speed_deg_s").value)
+                for joint in ("swing", "boom", "arm", "bucket")
+            },
         )
         self._drive_publisher = self.create_publisher(
             Twist, f"/{excavator}/tracks/cmd_vel", 10
@@ -242,6 +254,20 @@ class ScratchHciBridge(Node):
             )
             for joint in DIRECT_JOINT_NAMES
         }
+        self._active_axis_mask_publisher = (
+            self.create_publisher(
+                UInt8,
+                active_axis_mask_topic,
+                QoSProfile(
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
+            if active_axis_mask_topic
+            else None
+        )
+        self._publish_active_axis_mask()
         self._unity_position_publishers = {
             http_name: self.create_publisher(
                 Float64,
@@ -318,8 +344,9 @@ class ScratchHciBridge(Node):
             )
             return
         relative_command = RELATIVE_JOINT_COMMANDS.get(command)
-        if command in PID_HTTP_JOINT_NAMES:
-            joint_name = command
+        absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
+        if absolute_joint in PID_HTTP_JOINT_NAMES:
+            joint_name = absolute_joint
         elif (
             relative_command is not None
             and relative_command.joint in PID_HTTP_JOINT_NAMES
@@ -389,11 +416,27 @@ class ScratchHciBridge(Node):
         self._action_server_unavailable_reported = False
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(target.joint_names)
+        commanded_ros_joints = {
+            ros_name
+            for http_name, ros_name in PID_JOINTS
+            if any(
+                command.joint_name == http_name
+                for command in scheduled.commands
+            )
+        }
         goal.goal_tolerance = [
             JointTolerance(
                 name=joint_name,
-                position=self._trajectory_goal_tolerance_rad,
-                velocity=self._trajectory_stopped_velocity_rad_s,
+                position=(
+                    self._trajectory_goal_tolerance_rad
+                    if joint_name in commanded_ros_joints
+                    else -1.0
+                ),
+                velocity=(
+                    self._trajectory_stopped_velocity_rad_s
+                    if joint_name in commanded_ros_joints
+                    else -1.0
+                ),
             )
             for joint_name in target.joint_names
         ]
@@ -423,10 +466,12 @@ class ScratchHciBridge(Node):
                 "Trajectory queue changed before the goal could be tracked"
             )
             return
+        self._publish_active_axis_mask(scheduled)
         try:
             future = self._trajectory_client.send_goal_async(goal)
         except Exception as exception:
             self._trajectory_scheduler.mark_send_failed(scheduled)
+            self._publish_active_axis_mask()
             self.get_logger().error(f"Failed to send trajectory goal: {exception}")
             return
         self._goal_response_future = future
@@ -461,6 +506,26 @@ class ScratchHciBridge(Node):
             )
             self._unity_position_publishers[http_name].publish(message)
 
+    def _publish_active_axis_mask(
+        self, scheduled: ScheduledTrajectory | None = None
+    ) -> None:
+        """Permit hardware output only for joints commanded by this goal."""
+        publisher = getattr(self, "_active_axis_mask_publisher", None)
+        if publisher is None:
+            return
+        active_joints = (
+            {command.joint_name for command in scheduled.commands}
+            if scheduled is not None
+            else set()
+        )
+        mask = 0
+        for bit, (http_name, _) in enumerate(PID_JOINTS):
+            if http_name in active_joints:
+                mask |= 1 << bit
+        message = UInt8()
+        message.data = mask
+        publisher.publish(message)
+
     def _goal_response_callback(
         self, future: Any, scheduled: ScheduledTrajectory
     ) -> None:
@@ -482,6 +547,7 @@ class ScratchHciBridge(Node):
             goal_handle = future.result()
         except Exception as exception:
             self._trajectory_scheduler.mark_send_failed(scheduled)
+            self._publish_active_axis_mask()
             self.get_logger().error(f"Failed to send trajectory goal: {exception}")
             return
 
@@ -489,6 +555,7 @@ class ScratchHciBridge(Node):
             self._trajectory_scheduler.mark_completed(
                 scheduled, successful=False
             )
+            self._publish_active_axis_mask()
             self.get_logger().error(
                 "Trajectory goal was rejected; cleared queued trajectory commands"
             )
@@ -550,18 +617,29 @@ class ScratchHciBridge(Node):
             and wrapped_result.result.error_code
             == FollowJointTrajectory.Result.SUCCESSFUL
         )
+        preserve_queued = (
+            wrapped_result.status == GoalStatus.STATUS_ABORTED
+            and wrapped_result.result.error_code
+            == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED
+        )
         self._clear_active_goal_tracking()
         self._trajectory_scheduler.mark_completed(
-            scheduled, successful=successful
+            scheduled, successful=successful, preserve_queued=preserve_queued
         )
+        self._publish_active_axis_mask()
         if successful:
             self.get_logger().info(
                 f"Completed {scheduled.execution_mode.value} trajectory goal"
             )
             return
 
+        queue_action = (
+            "continuing queued trajectory commands"
+            if preserve_queued
+            else "cleared queued trajectory commands"
+        )
         self.get_logger().error(
-            "Trajectory failed; cleared queued trajectory commands: "
+            f"Trajectory failed; {queue_action}: "
             f"status={wrapped_result.status} "
             f"code={wrapped_result.result.error_code} "
             f"message={wrapped_result.result.error_string}"
@@ -728,6 +806,7 @@ class ScratchHciBridge(Node):
         # Scratchが先に終了しても、ノード停止時に走行指令を残さない。
         self._state.stop_drive()
         if rclpy.ok():
+            self._publish_active_axis_mask()
             self._publish_drive_and_direct_commands()
             if not self._drive_publisher.wait_for_all_acked(Duration(seconds=0.5)):
                 self.get_logger().warning(

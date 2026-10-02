@@ -56,15 +56,15 @@ HTTPだけを確認する例:
 ```bash
 # 既定はserial。明示する場合もvalにはダミー値を指定する
 curl 'http://localhost:8899/?type=command&cmd=serial&val=1'
-curl 'http://localhost:8899/?type=command&cmd=boom&val=-30'
+curl 'http://localhost:8899/?type=command&cmd=boom_angle&val=-30'
 curl 'http://localhost:8899/?type=command&cmd=boom_up&val=10'
 curl 'http://localhost:8899/?type=command&cmd=swing_left&val=30'
 curl 'http://localhost:8899/?type=command&cmd=bucket_dump&val=15'
 
 # 以後のPID関節命令をparallelへ切り替える
 curl 'http://localhost:8899/?type=command&cmd=parallel&val=1'
-curl 'http://localhost:8899/?type=command&cmd=boom&val=-50'
-curl 'http://localhost:8899/?type=command&cmd=arm&val=100'
+curl 'http://localhost:8899/?type=command&cmd=boom_angle&val=-50'
+curl 'http://localhost:8899/?type=command&cmd=arm_angle&val=100'
 
 # crawlerは実行モードの対象外
 curl 'http://localhost:8899/?type=command&cmd=left_crawler_speed&val=0.5'
@@ -83,7 +83,7 @@ URLを`curl`で実行して確認してください。
 
 ## command
 
-- 絶対目標角度[deg]: `blade`, `body`, `swing`, `boom`, `arm`, `bucket`, `thumb`
+- 絶対目標角度[deg]: `blade_angle`, `body_angle`, `swing_angle`, `boom_angle`, `arm_angle`, `bucket_angle`, `thumb_angle`
 - PID関節の相対移動量[deg]: `swing_left`, `swing_right`, `boom_up`,
   `boom_down`, `arm_extend`, `arm_retract`, `bucket_dump`, `bucket_scoop`
 - PID関節の角速度上限[deg/s]: `swing_speed`, `boom_speed`, `arm_speed`,
@@ -91,7 +91,9 @@ URLを`curl`で実行して確認してください。
 - PID関節の実行モード: `serial`, `parallel`（`val`は未使用）
 - 左右クローラ速度: `left_crawler_speed`, `right_crawler_speed`
 
-絶対関節命令は`cmd=<関節名>&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
+旧形式の `boom` など軸名だけのコマンドは受け付けません。
+
+絶対関節命令は`cmd=<関節名>_angle&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
 `arm`, `bucket`は、受理した角度を可動域内へ制限し、4軸をまとめてradへ変換して
 `FollowJointTrajectory` goalとして送ります。今回のHTTPバッチで指定されていない軸は、
 送信時点の最新`/joint_states`角度で保持します。現在角度が揃う前に受信した命令は破棄せず
@@ -206,7 +208,7 @@ ROSの`Duration`で表現できないほど小さい正値は拒否します。
 ```bash
 # boomを最大5 deg/sに設定し、その後-30 degreeへ動かす
 curl 'http://localhost:8899/?type=command&cmd=boom_speed&val=5'
-curl 'http://localhost:8899/?type=command&cmd=boom&val=-30'
+curl 'http://localhost:8899/?type=command&cmd=boom_angle&val=-30'
 
 # boomの角速度上限を解除
 curl 'http://localhost:8899/?type=command&cmd=boom_speed&val=0'
