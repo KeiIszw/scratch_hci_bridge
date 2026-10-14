@@ -110,6 +110,8 @@ class TrajectoryScheduler:
         self._revision = 0
         self._next_batch_id = 0
         self._next_dispatch_id = 0
+        # 再生側が失敗を見逃さないよう、Action失敗を再起動まで保持する。
+        self._motion_failed = False
 
     @property
     def selected_execution_mode(self) -> ExecutionMode:
@@ -127,10 +129,10 @@ class TrajectoryScheduler:
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
-            # Older HCI builds did not await fetch. As in the OCS implementation,
-            # let the first explicit mode adopt a still-open batch when requests
-            # arrive in the opposite order. Keep that adopted batch open so motion
-            # requests that followed the mode marker can still join it.
+            # 旧HCI版ではfetchの完了を待っていなかった。OCSの実装と同様に、
+            # 要求が逆順に届いた場合、最初の明示的なモードで未確定のバッチを引き継ぐ。
+            # 引き継いだバッチを未確定のまま保持し、モード指定の後に届く
+            # 動作要求も同じバッチに追加できるようにする。
             if self._startup_mode_window_open and self._building_batch is not None:
                 self._building_batch.mode = parsed_mode
                 partitions = self._partition_parallel_swing_batch(
@@ -199,9 +201,9 @@ class TrajectoryScheduler:
                     for command in self._building_batch.commands
                 )
             ):
-                # A continuous joint has no unambiguous shortest direction at
-                # half a revolution. Keep each swing command in its own goal so
-                # parallel sums or absolute/relative mixes cannot cross it.
+                # 連続回転関節では、半回転の位置で最短方向が一意に決まらない。
+                # 各旋回指令を個別のゴールに分けることで、並列指令の合算や
+                # 絶対・相対指令の混在で半回転を越えないようにする。
                 self._seal_building_batch()
                 self._next_batch_id += 1
                 self._building_batch = _MotionBatch(
@@ -253,9 +255,9 @@ class TrajectoryScheduler:
                         http_name, successful_target, position_rad
                     )
                     if terminal_error > self._completion_tolerance_rad:
-                        # An Action result can overtake delayed intermediate
-                        # JointState samples. Keep the successful target as the
-                        # relative-command origin until terminal feedback arrives.
+                        # アクション結果は、遅延した途中位置のJointStateサンプルより先に届く場合がある。
+                        # 終端のフィードバックが届くまでは、成功した目標値を
+                        # 相対指令の基準として保持する。
                         self._feedback_revisions[http_name] = self._feedback_revision
                         self._feedback_updated_at[http_name] = current_time
                         continue
@@ -379,9 +381,9 @@ class TrajectoryScheduler:
                 or self._in_flight.dispatch_id != scheduled.dispatch_id
             ):
                 return False
-            # Commands stay at the head of the ready queue until successful
-            # completion. Preserve the already-resolved absolute goal so an
-            # ambiguous transport failure cannot apply a relative offset twice.
+            # 指令は正常に完了するまで実行待ちキューの先頭に保持する。
+            # 解決済みの絶対目標を保持し、結果が不明な通信障害によって
+            # 相対オフセットが二重に適用されないようにする。
             self._retry_trajectory = scheduled
             self._in_flight = None
         return True
@@ -397,10 +399,14 @@ class TrajectoryScheduler:
             ):
                 return False
 
+            if not successful:
+                # 待機キューを破棄しても、HTTP reporterでは失敗が分かるようにする。
+                self._motion_failed = True
+
             if not successful and not preserve_queued:
-                # A serial successor must never run after its predecessor failed.
-                # Drop queued work but retain the selected mode so a later HTTP
-                # command can start a fresh batch without restarting the node.
+                # 先行指令が失敗した場合、後続の直列指令は実行しない。
+                # 待機中の処理を破棄して選択中のモードは保持し、後続のHTTP指令で
+                # ノードを再起動せずに新しいバッチを開始できるようにする。
                 self._ready_batches.clear()
                 self._building_batch = None
                 self._building_deadline = None
@@ -425,10 +431,10 @@ class TrajectoryScheduler:
                 scheduled.target.positions_rad,
                 scheduled.feedback_revisions,
             ) if successful else ()):
-                # Failed goals must retain measured positions for successors.
-                # The action result can be delivered before the corresponding
-                # JointState callback. Seed the hold position from the successful
-                # full goal only when no newer physical feedback was received.
+                # ゴールが失敗した場合は、後続指令のために実測位置を保持する。
+                # アクション結果は、対応する
+                # 対応するJointStateコールバックより先に届く場合がある。新しい実測値を
+                # 受信していない場合に限り、成功した全関節の目標値を保持位置の初期値にする。
                 latest_position = self._feedback_positions_rad[http_name]
                 latest_error = _position_error_rad(
                     http_name, target_position, latest_position
@@ -443,8 +449,8 @@ class TrajectoryScheduler:
                             target_position
                         )
                 else:
-                    # A newer, within-tolerance physical sample remains the
-                    # authoritative origin for the next relative command.
+                    # 新しい実測値が許容誤差内なら、その値を
+                    # 次の相対指令の基準として優先する。
                     self._successful_feedback_targets_rad.pop(http_name, None)
             if batch.mode == ExecutionMode.SERIAL:
                 batch.commands.pop(0)
@@ -468,6 +474,15 @@ class TrajectoryScheduler:
                 for http_name, _ in PID_JOINTS
                 if not self._feedback_is_fresh(http_name, current_time)
             )
+
+    def motion_status(self) -> int:
+        """動作状態を返す。0=待機、1=処理中、-1=失敗（再起動まで保持）。"""
+        with self._lock:
+            if self._motion_failed:
+                return -1
+            # 送信前のバッチ集約・待機キューも処理中に含める。
+            # 受付直後、Action送信前の短い時間を「完了」と誤判定させない。
+            return int(bool(self._building_batch or self._ready_batches or self._in_flight))
 
     def queued_command_count(self) -> int:
         with self._lock:
@@ -555,7 +570,7 @@ class TrajectoryScheduler:
         if self._feedback_timeout_sec == 0.0:
             return True
         updated_at = self._feedback_updated_at[http_name]
-        # A negative age is possible only in tests that supply a synthetic clock.
+        # 経過時間が負になるのは、擬似時計を使うテストの場合だけである。
         return now <= updated_at or now - updated_at <= self._feedback_timeout_sec
 
     def _seal_expired_building_batch(self, now: float) -> None:

@@ -164,8 +164,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
             initial_mode_command_wait_sec=0.5,
         )
         _feedback(scheduler)
-        # Model an older non-awaiting HCI build where the first mode request
-        # reaches the server between the two motion requests.
+        # 非同期処理の完了を待たない旧HCI版を再現する。最初のモード要求が
+        # 2つの動作要求の間にサーバーへ届く。
         scheduler.update_http_target("boom_angle", -50.0, now=1.0)
         scheduler.set_execution_mode("parallel", now=1.01)
         scheduler.update_http_target("arm_angle", 32.0, now=1.02)
@@ -400,8 +400,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert first is not None
         self.assertTrue(scheduler.mark_submitted(first))
 
-        # This sample was received after dispatch but is still an intermediate
-        # position. The successful Action result proves the final target was met.
+        # このサンプルは送信後に受信したが、まだ途中位置を示している。
+        # アクションの成功結果により、最終目標への到達が確認できる。
         _feedback(scheduler, boom=-55.0)
         self.assertTrue(scheduler.mark_completed(first, successful=True))
         second = scheduler.pending_snapshot(now=1.061)
@@ -427,8 +427,8 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertTrue(scheduler.mark_submitted(first))
         self.assertTrue(scheduler.mark_completed(first, successful=True))
 
-        # This delayed sample predates the Action success and must not replace
-        # the successful -60 degree seed used by the serial successor.
+        # この遅延サンプルはアクション成功前の値なので、直列の後続指令が使う
+        # 成功時の初期値である-60度を置き換えてはならない。
         _feedback(scheduler, boom=-55.0, now=1.062)
         second = scheduler.pending_snapshot(now=1.062)
 

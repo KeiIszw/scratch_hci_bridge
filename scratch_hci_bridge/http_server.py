@@ -21,6 +21,8 @@ CommandCallback = Callable[[str, float], None]
 class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
     state: CommandState
     command_callback: CommandCallback | None = None
+    # 動作状態の読み取り専用窓口。操作状態を書き換えるcommand callbackとは分ける。
+    status_callback: Callable[[], int] | None = None
 
     def do_GET(self) -> None:
         parsed_path = urlparse(self.path)
@@ -37,6 +39,15 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         if set(query) != {"type", "cmd", "val"}:
             self._send_text(400, "only type, cmd and val are allowed")
+            return
+        # Scratchから動作完了を確認する要求。ここでは新しい動作指令を登録しない。
+        if query["type"] == ["reporter"]:
+            callback = type(self).status_callback
+            if query["cmd"] != ["motion_status"] or query["val"] != ["0"] or callback is None:
+                self._send_text(400, "type=command is required")
+                return
+            # 空文字などが数値0と扱われても完了にならないよう、明示的な文字列で返す。
+            self._send_text(200, {0: "idle", 1: "busy", -1: "failed"}.get(callback(), "failed"))
             return
         if query["type"] != ["command"]:
             self._send_text(400, "type=command is required")
@@ -114,11 +125,13 @@ def create_http_server(
     port: int,
     state: CommandState,
     command_callback: CommandCallback | None = None,
+    status_callback: Callable[[], int] | None = None,
 ) -> ScratchHTTPServer:
     class BoundScratchHTTPRequestHandler(ScratchHTTPRequestHandler):
         pass
 
     BoundScratchHTTPRequestHandler.state = state
     BoundScratchHTTPRequestHandler.command_callback = staticmethod(command_callback)
-    # Process one request at a time so commands are handed to ROS in arrival order.
+    # 要求を1件ずつ処理し、到着順に指令をROSへ渡す。
+    BoundScratchHTTPRequestHandler.status_callback = staticmethod(status_callback)
     return ScratchHTTPServer((host, port), BoundScratchHTTPRequestHandler)

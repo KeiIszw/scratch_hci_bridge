@@ -297,3 +297,10 @@ cd ~/ros2_ws
 colcon test --packages-select scratch_hci_bridge --event-handlers console_direct+
 colcon test-result --verbose
 ```
+
+## Measured motion reporter
+
+GET /?type=reporter&cmd=motion_status&val=0 returns idle, busy, or failed.
+Busy includes batching, queued and running goals. Failure is latched until node restart.
+This read-only endpoint is used by tb20e_motion_capture between measured segments.
+Scratch timeout stops subsequent commands but does not cancel an active Action.

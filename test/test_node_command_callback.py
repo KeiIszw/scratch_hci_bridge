@@ -210,9 +210,9 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertTrue(state.apply_command("swing_left", -30.0))
         bridge._command_callback("swing_left", -30.0)
 
-        # CommandState keeps its clamped absolute state for direct publishing,
-        # but the scheduler needs raw 100 so parallel absolute+relative mixing
-        # is clamped only after the final target has been composed.
+        # CommandStateは直接配信するために制限済みの絶対値を保持するが、
+        # スケジューラは未制限の100を必要とする。並列の絶対・相対指令は、
+        # 最終目標を合成してから制限する。
         self.assertEqual(state.snapshot().joints_deg["boom"], 48.0)
         self.assertEqual(
             scheduler.targets,

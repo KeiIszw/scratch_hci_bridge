@@ -12,8 +12,8 @@ PID_JOINT_NAMES = ("swing", "boom", "arm", "bucket")
 JOINT_SPEED_COMMANDS = {
     f"{joint}_speed": joint for joint in PID_JOINT_NAMES
 }
-# builtin_interfaces/Duration stores whole seconds in a signed 32-bit field.
-# Keep generated durations at or below this exactly representable boundary.
+# builtin_interfaces/Durationは整数秒を符号付き32ビットフィールドに格納する。
+# 生成する時間は、正確に表現できるこの上限以下にする。
 MAX_ROS_DURATION_SEC = float((1 << 31) - 1)
 _MAX_PID_JOINT_TRAVEL_DEG = 360.0
 MAX_RELATIVE_SWING_DEG = 180.0
@@ -35,11 +35,11 @@ class RelativeJointCommand:
     direction: float
 
 
-# Use the physical direction names from OCS20250118, mapped onto OperaSim's
-# joint coordinates. The HTTP value is a magnitude; the name sets direction.
+# OCS20250118の実機方向名をOperaSimの関節座標に対応させる。
+# HTTP値は大きさを表し、名前で方向を決める。
 RELATIVE_JOINT_COMMANDS = {
-    # swing_joint rotates the vehicle upper body about ROS +Z. Positive yaw is
-    # physically left and negative yaw is physically right in OperaSim.
+    # swing_jointは車体上部をROSの+Z軸周りに回転させる。
+    # OperaSimでは正のヨーが実機の左方向、負のヨーが右方向に対応する。
     "swing_left": RelativeJointCommand("swing", 1.0),
     "swing_right": RelativeJointCommand("swing", -1.0),
     "boom_up": RelativeJointCommand("boom", -1.0),
@@ -135,8 +135,8 @@ class CommandState:
                 self._joints_deg[joint] = _clamp_joint(joint, value)
                 return True
             if command in RELATIVE_JOINT_COMMANDS:
-                # Relative PID targets are resolved from fresh joint feedback by
-                # TrajectoryScheduler when their batch is dispatched.
+                # 相対PID目標は、バッチ送信時にTrajectorySchedulerが
+                # 最新の関節フィードバックを使って解決する。
                 return is_safe_relative_swing_command(command, value)
             speed_joint = JOINT_SPEED_COMMANDS.get(command)
             if speed_joint is not None:
@@ -150,8 +150,8 @@ class CommandState:
                 return True
             execution_mode = EXECUTION_MODE_COMMANDS.get(command)
             if execution_mode is not None:
-                # The HCI block always supplies val, but mode commands use it only
-                # to satisfy the common HTTP command shape.
+                # HCIブロックは常にvalを渡すが、モード指令では共通のHTTP形式に
+                # 合わせるためだけに使用する。
                 self._execution_mode = execution_mode
                 return True
             if command == "left_crawler_speed":

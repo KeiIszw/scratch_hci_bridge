@@ -309,6 +309,8 @@ class ScratchHciBridge(Node):
             http_port,
             self._state,
             self._command_callback,
+            # HTTPの完了確認は、同じschedulerが管理するキューとAction状態を参照する。
+            self._trajectory_scheduler.motion_status,
         )
         self._http_thread = threading.Thread(
             target=self._http_server.serve_forever,
@@ -788,9 +790,9 @@ class ScratchHciBridge(Node):
             and response_future is self._goal_response_future
             and response_scheduled is not None
         ):
-            # rclpy marks a Future done before its queued done-callback is
-            # necessarily executed. Resolve it here so an accepted goal can
-            # still be cancelled during the bounded shutdown window.
+            # rclpyはキュー内の完了コールバックが実行される前にFutureを完了状態にする。
+            # ここで結果を解決し、受理済みのゴールを
+            # 終了処理の制限時間内にキャンセルできるようにする。
             self._goal_response_callback(
                 response_future,
                 response_scheduled,
