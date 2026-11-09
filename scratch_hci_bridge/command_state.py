@@ -74,7 +74,7 @@ SUPPORTED_COMMANDS = (
     | frozenset(JOINT_SPEED_COMMANDS)
     | frozenset(EXECUTION_MODE_COMMANDS)
     | frozenset(RELATIVE_JOINT_COMMANDS)
-    | frozenset(("left_crawler_speed", "right_crawler_speed"))
+    | frozenset(("left_crawler_speed", "right_crawler_speed", "stop", "reset", "begin", "commit"))
 )
 
 
@@ -129,6 +129,8 @@ class CommandState:
     def apply_command(self, command: str, value: float) -> bool:
         if not math.isfinite(value):
             return False
+        if command in ("stop", "reset", "begin", "commit"):
+            return command != "commit" or value in (0, 1)
         with self._lock:
             joint = ABSOLUTE_JOINT_COMMANDS.get(command)
             if joint is not None:

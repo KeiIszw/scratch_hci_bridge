@@ -191,7 +191,7 @@ class HttpServerTest(unittest.TestCase):
             )
 
             result = _get(f"{base_url}?type=reporter&cmd=boom_angle&val=0")
-            self.assertEqual(result, (400, "type=command is required", "*"))
+            self.assertEqual(result, (400, "unknown reporter", "*"))
 
             status, body, _ = _get(
                 f"{base_url}?type=command&cmd=boom_angle&val=nan"

@@ -8,6 +8,9 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
+            *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
+                ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0),
+                ("batch_open_timeout_sec", 5.0), ("relative_basis_max_error_deg", 5.0))],
             DeclareLaunchArgument("excavator", default_value="tb20e"),
             DeclareLaunchArgument("publish_hz", default_value="50.0"),
             DeclareLaunchArgument("http_host", default_value="0.0.0.0"),
@@ -65,6 +68,9 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     {
+                        **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
+                           for name in ("client_lease_sec", "max_dispatch_delay_sec",
+                                        "batch_open_timeout_sec", "relative_basis_max_error_deg")},
                         "excavator": LaunchConfiguration("excavator"),
                         "publish_hz": ParameterValue(
                             LaunchConfiguration("publish_hz"), value_type=float

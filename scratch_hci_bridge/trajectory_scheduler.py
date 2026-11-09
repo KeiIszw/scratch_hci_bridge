@@ -44,6 +44,8 @@ class _MotionBatch:
     batch_id: int
     mode: ExecutionMode
     commands: list[QueuedMotionCommand]
+    ready_at: float | None = None
+    wait_stopped: bool = True
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class ScheduledTrajectory:
     commands: tuple[QueuedMotionCommand, ...]
     target: TrajectoryTargetSnapshot
     feedback_revisions: tuple[int, ...]
+    wait_stopped: bool = True
 
 
 class TrajectoryScheduler:
@@ -65,6 +68,9 @@ class TrajectoryScheduler:
         initial_mode_command_wait_sec: float = 0.5,
         completion_tolerance_deg: float = 0.75,
         feedback_timeout_sec: float = 0.5,
+        max_dispatch_delay_sec: float = 1.0,
+        batch_open_timeout_sec: float = 5.0,
+        relative_basis_max_error_deg: float = 5.0,
     ) -> None:
         if not math.isfinite(batch_wait_sec) or batch_wait_sec < 0.0:
             raise ValueError("batch_wait_sec must be finite and non-negative")
@@ -90,10 +96,19 @@ class TrajectoryScheduler:
                 "feedback_timeout_sec must be finite and non-negative"
             )
 
-        self._lock = threading.Lock()
+        for value in (max_dispatch_delay_sec, batch_open_timeout_sec, relative_basis_max_error_deg):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("safety parameters must be finite and positive")
+        self._max_dispatch_delay_sec = max_dispatch_delay_sec
+        self._batch_open_timeout_sec = batch_open_timeout_sec
+        self._relative_basis_max_error_rad = math.radians(relative_basis_max_error_deg)
+        self._explicit_opened_at = None
+        self._last_error = ""
+        self._stopped = False
+        self._interrupting = False
+        self._lock = threading.RLock()
         self._batch_wait_sec = batch_wait_sec
         self._initial_mode_command_wait_sec = initial_mode_command_wait_sec
-        self._completion_tolerance_rad = math.radians(completion_tolerance_deg)
         self._feedback_timeout_sec = feedback_timeout_sec
         self._feedback_positions_rad: dict[str, float] = {}
         self._feedback_revisions: dict[str, int] = {}
@@ -110,7 +125,7 @@ class TrajectoryScheduler:
         self._revision = 0
         self._next_batch_id = 0
         self._next_dispatch_id = 0
-        # 再生側が失敗を見逃さないよう、Action失敗を再起動まで保持する。
+        # 再生側が失敗を見逃さないよう、resetまでAction失敗を保持する。
         self._motion_failed = False
 
     @property
@@ -129,6 +144,8 @@ class TrajectoryScheduler:
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
+            if self._explicit_opened_at is not None:
+                return True
             # 旧HCI版ではfetchの完了を待っていなかった。OCSの実装と同様に、
             # 要求が逆順に届いた場合、最初の明示的なモードで未確定のバッチを引き継ぐ。
             # 引き継いだバッチを未確定のまま保持し、モード指定の後に届く
@@ -139,6 +156,8 @@ class TrajectoryScheduler:
                     self._building_batch
                 )
                 if len(partitions) > 1:
+                    if not self._ready_batches and self._in_flight is None:
+                        partitions[0].ready_at = current_time
                     self._ready_batches.extend(partitions[:-1])
                     self._building_batch = partitions[-1]
                 self._selected_mode = parsed_mode
@@ -146,7 +165,7 @@ class TrajectoryScheduler:
                 self._building_deadline = current_time + self._batch_wait_sec
                 return True
 
-            self._seal_building_batch()
+            self._seal_building_batch(current_time)
             self._selected_mode = parsed_mode
             self._startup_mode_window_open = False
         return True
@@ -185,6 +204,7 @@ class TrajectoryScheduler:
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
+            self._stopped = False
             if self._building_batch is None:
                 self._next_batch_id += 1
                 self._building_batch = _MotionBatch(
@@ -194,7 +214,8 @@ class TrajectoryScheduler:
                 )
 
             if (
-                joint_name == "swing"
+                self._explicit_opened_at is None
+                and joint_name == "swing"
                 and self._building_batch.mode == ExecutionMode.PARALLEL
                 and any(
                     command.joint_name == "swing"
@@ -204,7 +225,7 @@ class TrajectoryScheduler:
                 # 連続回転関節では、半回転の位置で最短方向が一意に決まらない。
                 # 各旋回指令を個別のゴールに分けることで、並列指令の合算や
                 # 絶対・相対指令の混在で半回転を越えないようにする。
-                self._seal_building_batch()
+                self._seal_building_batch(current_time)
                 self._next_batch_id += 1
                 self._building_batch = _MotionBatch(
                     batch_id=self._next_batch_id,
@@ -247,21 +268,6 @@ class TrajectoryScheduler:
                 return
             self._feedback_revision += 1
             for http_name, position_rad in updates:
-                successful_target = self._successful_feedback_targets_rad.get(
-                    http_name
-                )
-                if successful_target is not None:
-                    terminal_error = _position_error_rad(
-                        http_name, successful_target, position_rad
-                    )
-                    if terminal_error > self._completion_tolerance_rad:
-                        # アクション結果は、遅延した途中位置のJointStateサンプルより先に届く場合がある。
-                        # 終端のフィードバックが届くまでは、成功した目標値を
-                        # 相対指令の基準として保持する。
-                        self._feedback_revisions[http_name] = self._feedback_revision
-                        self._feedback_updated_at[http_name] = current_time
-                        continue
-                    self._successful_feedback_targets_rad.pop(http_name, None)
                 self._feedback_positions_rad[http_name] = position_rad
                 self._feedback_revisions[http_name] = self._feedback_revision
                 self._feedback_updated_at[http_name] = current_time
@@ -283,6 +289,10 @@ class TrajectoryScheduler:
         with self._lock:
             self._seal_expired_building_batch(current_time)
             if self._in_flight is not None or not self._ready_batches:
+                return None
+            batch = self._ready_batches[0]
+            if batch.ready_at is not None and current_time - batch.ready_at > self._max_dispatch_delay_sec:
+                self.stop("stale")
                 return None
             if any(
                 not self._feedback_is_fresh(http_name, current_time)
@@ -317,13 +327,13 @@ class TrajectoryScheduler:
             for http_name, _ in PID_JOINTS:
                 joint_commands = commands_by_joint[http_name]
                 if not joint_commands:
-                    positions_rad.append(self._feedback_positions_rad[http_name])
+                    positions_rad.append(self._relative_basis(http_name, self._feedback_positions_rad[http_name]))
                     continue
 
                 current_position = self._feedback_positions_rad[http_name]
                 target_position = _resolve_target_position_rad(
                     http_name,
-                    current_position,
+                    self._relative_basis(http_name, current_position),
                     joint_commands,
                 )
                 positions_rad.append(target_position)
@@ -360,6 +370,7 @@ class TrajectoryScheduler:
                 execution_mode=batch.mode,
                 commands=commands,
                 target=target,
+                wait_stopped=batch.wait_stopped,
                 feedback_revisions=tuple(
                     self._feedback_revisions[http_name]
                     for http_name, _ in PID_JOINTS
@@ -384,13 +395,20 @@ class TrajectoryScheduler:
             # 指令は正常に完了するまで実行待ちキューの先頭に保持する。
             # 解決済みの絶対目標を保持し、結果が不明な通信障害によって
             # 相対オフセットが二重に適用されないようにする。
-            self._retry_trajectory = scheduled
+            if self._interrupting:
+                self._interrupting = False
+                self._retry_trajectory = None
+                if self._ready_batches:
+                    self._ready_batches[0].ready_at = time.monotonic()
+            else:
+                self._retry_trajectory = scheduled
             self._in_flight = None
         return True
 
     def mark_completed(
         self, scheduled: ScheduledTrajectory, *, successful: bool,
         preserve_queued: bool = False,
+        now: float | None = None, reason: str = "goal_aborted",
     ) -> bool:
         with self._lock:
             if (
@@ -399,7 +417,17 @@ class TrajectoryScheduler:
             ):
                 return False
 
+            # タイマーが動かなかった間に確定した待機バッチにも、終端時刻を起点として与える。
+            self._seal_expired_building_batch(time.monotonic() if now is None else now)
+            if self._interrupting:
+                self._in_flight = None
+                self._interrupting = False
+                if self._ready_batches:
+                    self._ready_batches[0].ready_at = time.monotonic() if now is None else now
+                return True
             if not successful:
+                self._last_error = reason
+                self._successful_feedback_targets_rad.clear()
                 # 待機キューを破棄しても、HTTP reporterでは失敗が分かるようにする。
                 self._motion_failed = True
 
@@ -410,6 +438,7 @@ class TrajectoryScheduler:
                 self._ready_batches.clear()
                 self._building_batch = None
                 self._building_deadline = None
+                self._explicit_opened_at = None
                 self._in_flight = None
                 self._retry_trajectory = None
                 return True
@@ -418,40 +447,17 @@ class TrajectoryScheduler:
                 self._ready_batches.clear()
                 self._building_batch = None
                 self._building_deadline = None
+                self._explicit_opened_at = None
                 self._in_flight = None
                 self._retry_trajectory = None
                 return False
 
             batch = self._ready_batches[0]
-            commanded_joint_names = {
-                command.joint_name for command in scheduled.commands
-            }
-            for (http_name, _), target_position, feedback_revision in (zip(
-                PID_JOINTS,
-                scheduled.target.positions_rad,
-                scheduled.feedback_revisions,
+            for (http_name, _), target_position in (zip(
+                PID_JOINTS, scheduled.target.positions_rad,
             ) if successful else ()):
-                # ゴールが失敗した場合は、後続指令のために実測位置を保持する。
-                # アクション結果は、対応する
-                # 対応するJointStateコールバックより先に届く場合がある。新しい実測値を
-                # 受信していない場合に限り、成功した全関節の目標値を保持位置の初期値にする。
-                latest_position = self._feedback_positions_rad[http_name]
-                latest_error = _position_error_rad(
-                    http_name, target_position, latest_position
-                )
-                if (
-                    self._feedback_revisions[http_name] <= feedback_revision
-                    or latest_error > self._completion_tolerance_rad
-                ):
-                    self._feedback_positions_rad[http_name] = target_position
-                    if http_name in commanded_joint_names:
-                        self._successful_feedback_targets_rad[http_name] = (
-                            target_position
-                        )
-                else:
-                    # 新しい実測値が許容誤差内なら、その値を
-                    # 次の相対指令の基準として優先する。
-                    self._successful_feedback_targets_rad.pop(http_name, None)
+                # 実測値は保持し、成功目標だけを次の相対指令の候補として残す。
+                self._successful_feedback_targets_rad[http_name] = target_position
             if batch.mode == ExecutionMode.SERIAL:
                 batch.commands.pop(0)
             else:
@@ -460,6 +466,9 @@ class TrajectoryScheduler:
                 self._ready_batches.popleft()
             self._in_flight = None
             self._retry_trajectory = None
+            # 後続バッチも直列の次指令も、実行中ゴールの終端までは送信できない。
+            if self._ready_batches:
+                self._ready_batches[0].ready_at = time.monotonic() if now is None else now
         return True
 
     def missing_feedback_joint_names(
@@ -475,14 +484,97 @@ class TrajectoryScheduler:
                 if not self._feedback_is_fresh(http_name, current_time)
             )
 
+    def motion_queue(self) -> int:
+        """実行中の指令を除き、構築中と未送信のバッチを数える。"""
+        with self._lock:
+            count = len(self._ready_batches) + int(self._building_batch is not None)
+            if self._in_flight is not None and self._ready_batches:
+                batch = self._ready_batches[0]
+                # serialバッチの未送信の残りがある場合は、そのバッチを残す。
+                if batch.batch_id == self._in_flight.batch_id and len(batch.commands) == len(self._in_flight.commands):
+                    count -= 1
+            return count
+
     def motion_status(self) -> int:
-        """動作状態を返す。0=待機、1=処理中、-1=失敗（再起動まで保持）。"""
+        """動作状態を返す。0=待機、1=処理中、-1=失敗、2=停止済み。"""
         with self._lock:
             if self._motion_failed:
                 return -1
+            if self._interrupting and self._in_flight is not None:
+                return 1
+            if self._stopped:
+                return 2
             # 送信前のバッチ集約・待機キューも処理中に含める。
             # 受付直後、Action送信前の短い時間を「完了」と誤判定させない。
             return int(bool(self._building_batch or self._ready_batches or self._in_flight))
+
+    def _relative_basis(self, joint: str, measured: float) -> float:
+        """小さな到達誤差の累積を防ぎ、大きなずれは実測に戻す。"""
+        target = self._successful_feedback_targets_rad.get(joint)
+        if target is not None and _position_error_rad(joint, target, measured) <= self._relative_basis_max_error_rad:
+            return target
+        return measured
+
+    def needs_cancel(self) -> bool:
+        with self._lock:
+            return self._interrupting
+
+    def has_work(self) -> bool:
+        with self._lock:
+            return bool(self._building_batch or self._ready_batches or self._in_flight)
+
+    def accept_motion(self) -> None:
+        with self._lock:
+            self._stopped = False
+
+    def motion_error(self) -> str:
+        with self._lock:
+            return self._last_error
+
+    def stop(self, reason: str = "stopped", *, reset: bool = False) -> None:
+        """送信待ちを破棄し、送信済みゴールの終端まではゲートを保持する。"""
+        with self._lock:
+            self._ready_batches.clear()
+            self._building_batch = None
+            self._building_deadline = None
+            self._explicit_opened_at = None
+            self._retry_trajectory = None
+            self._successful_feedback_targets_rad.clear()
+            self._interrupting = self._in_flight is not None
+            self._stopped = not reset and reason == "stopped"
+            self._motion_failed = not reset and reason != "stopped"
+            self._last_error = "" if reset else reason
+
+    def begin(self, now: float | None = None) -> None:
+        """明示バッチにはdebounceを適用しない。"""
+        with self._lock:
+            current = time.monotonic() if now is None else now
+            self._seal_expired_building_batch(current)
+            if self._explicit_opened_at is None:
+                self._seal_building_batch(current)
+            self._next_batch_id += 1
+            self._building_batch = _MotionBatch(self._next_batch_id, ExecutionMode.PARALLEL, [])
+            self._explicit_opened_at = current
+            self._stopped = False
+
+    def commit(self, wait_stopped: bool, now: float | None = None) -> None:
+        with self._lock:
+            current = time.monotonic() if now is None else now
+            self._seal_expired_building_batch(current)
+            if self._explicit_opened_at is None:
+                return
+            self._building_batch.wait_stopped = wait_stopped
+            self._explicit_opened_at = None
+            self._seal_building_batch(current)
+
+    def check_deadlines(self, now: float | None = None) -> None:
+        with self._lock:
+            current = time.monotonic() if now is None else now
+            self._seal_expired_building_batch(current)
+            if self._in_flight is None and self._ready_batches:
+                ready = self._ready_batches[0].ready_at
+                if ready is not None and current - ready > self._max_dispatch_delay_sec:
+                    self.stop("stale")
 
     def queued_command_count(self) -> int:
         with self._lock:
@@ -525,7 +617,7 @@ class TrajectoryScheduler:
                     ),
                 )
             else:
-                target_position = current_position
+                target_position = self._relative_basis(http_name, current_position)
             positions_rad.append(target_position)
 
         target = TrajectoryTargetSnapshot(
@@ -541,6 +633,7 @@ class TrajectoryScheduler:
             batch_id=retry.batch_id,
             execution_mode=retry.execution_mode,
             commands=retry.commands,
+            wait_stopped=retry.wait_stopped,
             target=target,
             feedback_revisions=tuple(
                 self._feedback_revisions[http_name]
@@ -574,18 +667,26 @@ class TrajectoryScheduler:
         return now <= updated_at or now - updated_at <= self._feedback_timeout_sec
 
     def _seal_expired_building_batch(self, now: float) -> None:
+        if self._explicit_opened_at is not None:
+            if now - self._explicit_opened_at >= self._batch_open_timeout_sec:
+                self.stop("stale")
+            return
         if (
             self._building_batch is not None
             and self._building_deadline is not None
             and now >= self._building_deadline
         ):
-            self._seal_building_batch()
+            self._seal_building_batch(self._building_deadline)
 
-    def _seal_building_batch(self) -> None:
+    def _seal_building_batch(self, now: float | None = None) -> None:
         if self._building_batch is not None and self._building_batch.commands:
-            self._ready_batches.extend(
-                self._partition_parallel_swing_batch(self._building_batch)
-            )
+            batches = self._partition_parallel_swing_batch(self._building_batch)
+            for batch in batches:
+                batch.ready_at = None
+                batch.wait_stopped = self._building_batch.wait_stopped
+            if not self._ready_batches and self._in_flight is None:
+                batches[0].ready_at = time.monotonic() if now is None else now
+            self._ready_batches.extend(batches)
             self._startup_mode_window_open = False
         self._building_batch = None
         self._building_deadline = None

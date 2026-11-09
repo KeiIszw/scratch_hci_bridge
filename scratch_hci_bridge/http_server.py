@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from scratch_hci_bridge.command_state import (
@@ -24,7 +25,15 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
     # 動作状態の読み取り専用窓口。操作状態を書き換えるcommand callbackとは分ける。
     status_callback: Callable[[], int] | None = None
 
+    request_callback = None
+    error_callback = None
+    queue_callback = None
+
     def do_GET(self) -> None:
+        request_callback = type(self).request_callback
+        if request_callback is not None:
+            request_callback(False)
+        self.request_order, self.request_epoch = self.server.request_orders[self.request]
         parsed_path = urlparse(self.path)
         if parsed_path.path != "/":
             self._send_text(404, "not found")
@@ -42,12 +51,22 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         # Scratchから動作完了を確認する要求。ここでは新しい動作指令を登録しない。
         if query["type"] == ["reporter"]:
-            callback = type(self).status_callback
-            if query["cmd"] != ["motion_status"] or query["val"] != ["0"] or callback is None:
-                self._send_text(400, "type=command is required")
+            if query["val"] != ["0"]:
+                self._send_text(400, "reporter val must be 0")
                 return
-            # 空文字などが数値0と扱われても完了にならないよう、明示的な文字列で返す。
-            self._send_text(200, {0: "idle", 1: "busy", -1: "failed"}.get(callback(), "failed"))
+            command = query["cmd"]
+            if command == ["heartbeat"]:
+                if request_callback is not None:
+                    request_callback(True)
+                self._send_text(200, "ok")
+            elif command == ["motion_error"] and type(self).error_callback is not None:
+                self._send_text(200, type(self).error_callback())
+            elif command == ["motion_queue"] and type(self).queue_callback is not None:
+                self._send_text(200, str(type(self).queue_callback()))
+            elif command == ["motion_status"] and type(self).status_callback is not None:
+                self._send_text(200, {0: "idle", 1: "busy", -1: "failed", 2: "stopped"}.get(type(self).status_callback(), "failed"))
+            else:
+                self._send_text(400, "unknown reporter")
             return
         if query["type"] != ["command"]:
             self._send_text(400, "type=command is required")
@@ -87,14 +106,35 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         ):
             self._send_text(400, "joint speed would exceed ROS Duration range")
             return
-        if not self.state.apply_command(command, value):
-            self._send_text(400, "command would produce a non-finite value")
+        if command == "commit" and value not in (0, 1):
+            self._send_text(400, "commit val must be 0 or 1")
             return
+        # 通常指令は接続受付順に適用する。停止はこの待ち列を通さず即座に適用する。
+        if command in ("stop", "reset"):
+            self._apply(command, value)
+        else:
+            with self.server.command_condition:
+                self.server.command_condition.wait_for(
+                    lambda: not any(n < self.request_order for n in self.server.pending_orders))
+            self._apply(command, value)
 
-        callback = type(self).command_callback
-        if callback is not None:
-            callback(command, value)
-        self._send_text(200, "OK")
+    def _apply(self, command: str, value: float) -> None:
+        # 状態とschedulerへの登録を同じ短い区間で更新し、停止との隙間をなくす。
+        accepted = True
+        with self.server.state_lock:
+            # 世代更新と停止処理の間に後続指令を受け付けると、その指令まで破棄されるため一体で更新する。
+            if command in ("stop", "reset"):
+                self.server.command_epoch += 1
+            expired = command not in ("stop", "reset") and self.request_epoch != self.server.command_epoch
+            if not expired:
+                accepted = self.state.apply_command(command, value)
+                callback = type(self).command_callback
+                if accepted and callback is not None:
+                    callback(command, value)
+        if accepted:
+            self._send_text(200, "OK")
+        else:
+            self._send_text(400, "command would produce a non-finite value")
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -110,7 +150,35 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class ScratchHTTPServer(HTTPServer):
+class ScratchHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, *args):
+        self.command_condition = threading.Condition()
+        self.state_lock = threading.RLock()
+        self.pending_orders = set()
+        self.request_orders = {}
+        self.next_order = 0
+        self.command_epoch = 0
+        super().__init__(*args)
+
+    def process_request(self, request, client_address):
+        # 停止の世代更新と受付を直列化し、停止後の接続へ古い世代を割り当てない。
+        with self.state_lock:
+            with self.command_condition:
+                self.next_order += 1
+                self.request_orders[request] = (self.next_order, self.command_epoch)
+                self.pending_orders.add(self.next_order)
+        super().process_request(request, client_address)
+
+    def finish_request(self, request, client_address):
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            with self.command_condition:
+                self.pending_orders.discard(self.request_orders.pop(request)[0])
+                self.command_condition.notify_all()
+
     allow_reuse_address = True
 
     def get_request(self):
@@ -126,12 +194,22 @@ def create_http_server(
     state: CommandState,
     command_callback: CommandCallback | None = None,
     status_callback: Callable[[], int] | None = None,
+    error_callback: Callable[[], str] | None = None,
+    request_callback: Callable[[bool], None] | None = None,
+    state_lock=None,
+    queue_callback: Callable[[], int] | None = None,
 ) -> ScratchHTTPServer:
     class BoundScratchHTTPRequestHandler(ScratchHTTPRequestHandler):
         pass
 
+    BoundScratchHTTPRequestHandler.queue_callback = staticmethod(queue_callback)
+    BoundScratchHTTPRequestHandler.error_callback = staticmethod(error_callback)
+    BoundScratchHTTPRequestHandler.request_callback = staticmethod(request_callback)
     BoundScratchHTTPRequestHandler.state = state
     BoundScratchHTTPRequestHandler.command_callback = staticmethod(command_callback)
     # 要求を1件ずつ処理し、到着順に指令をROSへ渡す。
     BoundScratchHTTPRequestHandler.status_callback = staticmethod(status_callback)
-    return ScratchHTTPServer((host, port), BoundScratchHTTPRequestHandler)
+    server = ScratchHTTPServer((host, port), BoundScratchHTTPRequestHandler)
+    if state_lock is not None:
+        server.state_lock = state_lock
+    return server

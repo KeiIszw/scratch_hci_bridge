@@ -78,7 +78,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         )
         self.assertTrue(
             math.isclose(
-                arm_goal.target.positions_rad[1], math.radians(-50.0)
+                arm_goal.target.positions_rad[1], math.radians(-80.0)
             )
         )
         self.assertTrue(
@@ -209,7 +209,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertEqual(second.execution_mode, ExecutionMode.PARALLEL)
         self.assertEqual(len(second.commands), 1)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(200.0))
+            math.isclose(second.target.positions_rad[0], math.radians(100.0))
         )
 
     def test_startup_mode_adoption_closes_after_first_default_batch(self) -> None:
@@ -320,7 +320,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert second is not None
         self.assertEqual(second.commands[0].degrees, 5.0)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[1], math.radians(-55.0))
+            math.isclose(second.target.positions_rad[1], math.radians(-45.0))
         )
 
     def test_relative_command_uses_latest_feedback_at_dispatch(self) -> None:
@@ -365,7 +365,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
                     )
                 )
 
-    def test_serial_relative_success_preserves_newer_physical_feedback(self) -> None:
+    def test_serial_relative_success_uses_target_with_small_error(self) -> None:
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler, boom=-50.0)
         scheduler.set_execution_mode("serial", now=0.0)
@@ -383,7 +383,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertTrue(
-            math.isclose(second.target.positions_rad[1], math.radians(-54.5))
+            math.isclose(second.target.positions_rad[1], math.radians(-55.0))
         )
 
     def test_serial_success_ignores_newer_feedback_outside_goal_tolerance(self) -> None:
@@ -400,8 +400,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert first is not None
         self.assertTrue(scheduler.mark_submitted(first))
 
-        # このサンプルは送信後に受信したが、まだ途中位置を示している。
-        # アクションの成功結果により、最終目標への到達が確認できる。
+        # 実測との差が基準角の許容5度以内なら、成功目標を相対基準にする。
         _feedback(scheduler, boom=-55.0)
         self.assertTrue(scheduler.mark_completed(first, successful=True))
         second = scheduler.pending_snapshot(now=1.061)
@@ -427,8 +426,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertTrue(scheduler.mark_submitted(first))
         self.assertTrue(scheduler.mark_completed(first, successful=True))
 
-        # この遅延サンプルはアクション成功前の値なので、直列の後続指令が使う
-        # 成功時の初期値である-60度を置き換えてはならない。
+        # 遅延した途中位置も実測として保存し、成功目標との差で基準を選ぶ。
         _feedback(scheduler, boom=-55.0, now=1.062)
         second = scheduler.pending_snapshot(now=1.062)
 
@@ -438,7 +436,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             math.isclose(second.target.positions_rad[1], math.radians(-55.0))
         )
 
-    def test_quarantine_releases_on_fresh_in_tolerance_feedback(self) -> None:
+    def test_fresh_in_tolerance_feedback_keeps_successful_target(self) -> None:
         scheduler = TrajectoryScheduler(
             batch_wait_sec=0.05,
             completion_tolerance_deg=0.75,
@@ -459,7 +457,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertTrue(
-            math.isclose(second.target.positions_rad[1], math.radians(-54.5))
+            math.isclose(second.target.positions_rad[1], math.radians(-55.0))
         )
 
     def test_parallel_relative_commands_share_origin_and_sum_offsets(self) -> None:
@@ -507,7 +505,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             math.isclose(goal.target.positions_rad[2], math.radians(115.0))
         )
 
-    def test_serial_relative_command_waits_then_uses_other_axis_feedback(self) -> None:
+    def test_serial_relative_command_waits_then_uses_successful_hold_target(self) -> None:
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler, boom=-50.0, arm=100.0)
         scheduler.set_execution_mode("serial", now=0.0)
@@ -528,7 +526,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert second is not None
         self.assertEqual(second.commands[0].http_name, "arm_retract")
         self.assertTrue(
-            math.isclose(second.target.positions_rad[2], math.radians(117.0))
+            math.isclose(second.target.positions_rad[2], math.radians(115.0))
         )
 
     def test_parallel_mixes_last_absolute_target_with_relative_sum(self) -> None:
@@ -647,7 +645,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert second is not None
         self.assertEqual(len(second.commands), 1)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(370.0))
+            math.isclose(second.target.positions_rad[0], math.radians(270.0))
         )
 
     def test_parallel_absolute_and_relative_swing_are_split(self) -> None:
@@ -676,7 +674,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(220.0))
+            math.isclose(second.target.positions_rad[0], math.radians(200.0))
         )
 
     def test_relative_swing_retry_preserves_unwrapped_target(self) -> None:
@@ -711,7 +709,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(successor)
         assert successor is not None
         self.assertTrue(
-            math.isclose(successor.target.positions_rad[0], math.radians(190.0))
+            math.isclose(successor.target.positions_rad[0], math.radians(-185.0))
         )
 
     def test_relative_target_is_clamped_before_duration_is_calculated(self) -> None:
@@ -852,7 +850,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(successor)
         assert successor is not None
         self.assertTrue(
-            math.isclose(successor.target.positions_rad[1], math.radians(-55.0))
+            math.isclose(successor.target.positions_rad[1], math.radians(-42.0))
         )
         self.assertTrue(
             math.isclose(successor.target.positions_rad[2], math.radians(100.0))

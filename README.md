@@ -96,10 +96,9 @@ URLを`curl`で実行して確認してください。
 絶対関節命令は`cmd=<関節名>_angle&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
 `arm`, `bucket`は、受理した角度を可動域内へ制限し、4軸をまとめてradへ変換して
 `FollowJointTrajectory` goalとして送ります。今回のHTTPバッチで指定されていない軸は、
-送信時点の最新`/joint_states`角度で保持します。現在角度が揃う前に受信した命令は破棄せず
-保留します。次のgoalは最新feedbackを基準に作ります。Action成功後に新しいfeedbackがまだ
-届いていない、または成功目標の許容差外にある途中サンプルしかない軸は、古い角度へ戻すことを
-防ぐため成功した目標角度で補完します。
+直前に成功したゴールの目標角度で保持します。ただし実測との誤差が
+`relative_basis_max_error_deg`を超える軸、またはstop/reset/失敗の後は最新の実測角度を使います。
+現在角度が揃う前に受信した命令は破棄せず保留し、実測値は成功目標で上書きしません。
 
 相対関節命令はOCS20250118と同じく、`val`の符号を無視して移動量の大きさ[deg]として
 使用します。方向はコマンド名で決まります。
@@ -153,7 +152,7 @@ TB20eのarm可動域は32--155 degreeです。絶対命令`arm=30`や、相対�
 
 `parallel`では`trajectory_debounce_sec`内に連続して届いたPID関節命令を1つの4軸goalへ
 まとめ、各軸を同時に開始します。同じバッチで同じ軸を複数回指定した場合は、最後の絶対角を
-使用します。相対命令は共通のfeedbackを原点として同じ軸の移動量を加算します。絶対・相対が
+使用します。相対命令は共通の基準角を原点として同じ軸の移動量を加算します。絶対・相対が
 混在した軸は「最後の絶対角 + 全相対移動量」を目標にします。厳密な命令順で同じ軸を段階的に
 動かす場合は`serial`を使用してください。実行中のgoalがある場合は、モードにかかわらず
 後続バッチをFIFOで待機させ、先行goalを新しいgoalで途中終了させません。
@@ -304,3 +303,65 @@ GET /?type=reporter&cmd=motion_status&val=0 returns idle, busy, or failed.
 Busy includes batching, queued and running goals. Failure is latched until node restart.
 This read-only endpoint is used by tb20e_motion_capture between measured segments.
 Scratch timeout stops subsequent commands but does not cancel an active Action.
+
+
+## Scratch同期と停止
+
+既存の `parallel` / `serial`、`*_angle`、`*_speed`、相対指令は引き続き使用できます。
+新しいプログラムでは、debounceで並列区間が分割されないよう明示バッチを使用します。
+以下はHTTP GETの `type` / `cmd` / `val` です。
+
+| type | cmd | val | 動作 |
+|---|---|---|---|
+| command | begin | 0 | parallelの明示バッチを開く |
+| command | commit | 0 | 位置許容だけで完了（指令関節のvelocity許容は-1） |
+| command | commit | 1 | 位置許容と停止速度許容で完了 |
+| command | stop | 任意の有限数値 | 構築中・送信待ちを破棄し、走行を0、軸マスクを0、goalをcancel |
+| command | reset | 0 | stop相当の処理を行い、失敗・停止状態と理由を解除 |
+| reporter | heartbeat | 0 | `ok` を返し、リース監視を有効にする |
+| reporter | motion_status | 0 | `idle` / `busy` / `failed` / `stopped` |
+| reporter | motion_error | 0 | 最後の失敗理由（なければ空文字） |
+
+明示バッチ内の `parallel` / `serial` は無視します。空バッチのcommitは何も送りません。
+開いたまま再びbeginした場合は、その未確定バッチを置き換えます。
+同一バッチに複数の旋回指令がある場合の安全な分割はcommit時に行います。
+従来の暗黙バッチは引き続きdebounceまたはモード変更で確定します。
+
+`busy` は構築中・送信待ち・実行中、およびcancelの終端result待ちを含みます。
+stopのHTTP応答はcancel完了を待ちません。通常のstop後は終端resultを受けて `stopped` になり、
+次の動作指令で解除します。resetも実行中goalの終端を待つ間は `busy` です。
+`failed` はresetまで保持します。理由は `lease_expired` / `stale` / `goal_rejected` /
+`goal_aborted` / `tolerance_violated` / `result_timeout` / `stopped` / 空文字です。
+既存互換のためgoal位置許容違反では既存の待ち列を継続しますが、失敗状態は保持します。
+
+heartbeat受信前はリース監視を行いません。一度有効になると、全HTTP GET要求
+（heartbeatやmotion_status、エラー応答になる要求も含む）がリースを更新します。
+バッチ構築中・送信待ち・goal実行中に通信が途絶するとstop相当の処理を行い、
+理由 `lease_expired` の `failed` にします。
+送信期限切れと明示バッチの開放期限切れは理由 `stale` です。
+serialの2番目以降の指令は、直前の指令の終端から送信期限を数えます。
+
+| パラメータ | 既定値 | 意味 |
+|---|---|---|
+| client_lease_sec | 2.0 | heartbeatで有効化後の通信途絶許容秒数 |
+| max_dispatch_delay_sec | 1.0 | バッチ確定後の送信待ち上限秒数 |
+| batch_open_timeout_sec | 5.0 | beginからcommitまでの上限秒数 |
+| relative_basis_max_error_deg | 5.0 | 成功目標を相対基準に使える実測との差 |
+
+追加パラメータは正の有限数値で、同名のlaunch引数から設定できます。
+相対指令は直前に成功した指令関節の目標角を基準とし、実測との差が上限を超える場合や
+stop/reset/失敗後は実測角に戻します。実測JointState自体は目標値で上書きしません。
+HTTPはdaemonスレッドの `ThreadingHTTPServer` です。通常指令は接続受付順に適用し、
+stop/resetとreporterはその待ち列を通りません。stop/reset以前から待機していたHTTP指令も
+破棄し、停止後の遅延登録を防ぎます。ROSとHTTPの短い状態更新は同一ロックで保護し、
+cancel完了やネットワーク応答をそのロック内で待ちません。
+
+### 送信待ちの確認と非指令軸の保持
+
+`/?type=reporter&cmd=motion_queue&val=0` は送信待ちのバッチ数を整数文字列で返します。
+構築中（begin直後を含む）と確定済みの未送信バッチを数え、実行中のゴールは除きます。
+serialバッチに未送信の指令が残る場合は、そのバッチを1件として数えます。
+`motion_status`も併用し、failed/stopped/errorを確認してください。
+commit 0の後続バッチは、前のゴールの終端後、次のタイマー周期で送信対象になります。
+非指令軸も相対指令と同じ基準で保持します。直前に成功したゴールの目標角を使い、
+実測との誤差が`relative_basis_max_error_deg`を超える軸、またはstop/reset/失敗の後は実測角を使います。

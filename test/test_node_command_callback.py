@@ -28,6 +28,9 @@ class _Scheduler:
         self.send_failures: list[Any] = []
         self.completions: list[tuple[Any, bool]] = []
 
+    def stop(self, reason="stopped", *, reset=False):
+        self.stop_reason = reason
+
     def update_http_target(
         self,
         command: str,
@@ -42,7 +45,7 @@ class _Scheduler:
         return True
 
     def mark_completed(
-        self, scheduled: Any, *, successful: bool, preserve_queued: bool = False
+        self, scheduled: Any, *, successful: bool, preserve_queued: bool = False, reason: str = "goal_aborted"
     ) -> bool:
         self.preserve_queued = preserve_queued
         self.completions.append((scheduled, successful))
@@ -115,6 +118,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
         scheduler = _Scheduler()
         logger = _Logger()
         bridge._trajectory_scheduler = scheduler
+        bridge._state = CommandState()
         bridge._trajectory_goal_response_timeout_sec = 5.0
         bridge._trajectory_result_timeout_margin_sec = 35.0
         bridge._goal_response_future = None
