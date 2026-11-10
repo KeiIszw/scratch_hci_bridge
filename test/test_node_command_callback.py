@@ -28,6 +28,15 @@ class _Scheduler:
         self.send_failures: list[Any] = []
         self.completions: list[tuple[Any, bool]] = []
 
+    def motion_error(self):
+        return ''
+
+    def goal_diagnostics(self, scheduled=None):
+        return 'axis=boom target_deg=-40.000 measured_deg=-41.000 delta_deg=1.000'
+
+    def touch_explicit_batch(self):
+        pass
+
     def stop(self, reason="stopped", *, reset=False):
         self.stop_reason = reason
 
@@ -118,6 +127,12 @@ class NodeCommandCallbackTest(unittest.TestCase):
         scheduler = _Scheduler()
         logger = _Logger()
         bridge._trajectory_scheduler = scheduler
+        bridge._mask_commanded_axes = set()
+        bridge._mask_catch_up_targets = {}
+        bridge._last_active_axis_mask = 0
+        bridge._catch_up_axes_in_mask = True
+        bridge._intermediate_tolerance_failure_fatal = False
+        bridge._intermediate_goal_time_tolerance_sec = 0.5
         bridge._state = CommandState()
         bridge._trajectory_goal_response_timeout_sec = 5.0
         bridge._trajectory_result_timeout_margin_sec = 35.0
@@ -128,6 +143,10 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge._active_goal_handle = None
         bridge._active_goal_scheduled = None
         bridge._goal_result_future = None
+        bridge._active_goal_planned_end = None
+        bridge._replacement_previous = None
+        bridge._replacement_deferred_result = None
+        bridge._stop_pending = False
         bridge._active_goal_deadline = None
         bridge._active_cancel_future = None
         bridge._active_cancel_requested = False
@@ -182,6 +201,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge = ScratchHciBridge.__new__(ScratchHciBridge)
         publisher = _Publisher()
         bridge._active_axis_mask_publisher = publisher
+        bridge._catch_up_axes_in_mask = False
         scheduled = SimpleNamespace(
             commands=(
                 SimpleNamespace(joint_name="boom"),
@@ -249,7 +269,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
 
     def test_goal_tolerance_failure_preserves_queue_and_releases_gate(self) -> None:
         bridge, scheduler, logger = self._bridge()
-        scheduled = SimpleNamespace(execution_mode=SimpleNamespace(value="serial"))
+        scheduled = SimpleNamespace(wait_stopped=False, execution_mode=SimpleNamespace(value="serial"))
         future = _Future(SimpleNamespace(
             status=6,
             result=SimpleNamespace(error_code=-5, error_string="goal_time_tolerance"),
@@ -259,10 +279,12 @@ class NodeCommandCallbackTest(unittest.TestCase):
 
         bridge._goal_result_callback(future, scheduled)
 
-        self.assertEqual(scheduler.completions, [(scheduled, False)])
-        self.assertTrue(scheduler.preserve_queued)
+        self.assertEqual(scheduler.completions, [(scheduled, True)])
+        self.assertFalse(scheduler.preserve_queued)
         self.assertIsNone(bridge._active_goal_scheduled)
-        self.assertIn("continuing queued", logger.error_messages[-1])
+        self.assertIn("continuing queued", logger.warning_messages[-1])
+        self.assertIn("delta_deg=1.000", logger.warning_messages[-1])
+        self.assertEqual(logger.error_messages, [])
 
     def test_result_response_exception_cancels_without_releasing_gate(self) -> None:
         bridge, scheduler, _logger = self._bridge()

@@ -5,7 +5,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from scratch_hci_bridge.command_state import (
@@ -57,6 +57,9 @@ class ScheduledTrajectory:
     target: TrajectoryTargetSnapshot
     feedback_revisions: tuple[int, ...]
     wait_stopped: bool = True
+    start_positions_rad: tuple[float, ...] = ()
+    start_velocities_rad_s: tuple[float, ...] = ()
+    end_velocities_rad_s: tuple[float, ...] = ()
 
 
 class TrajectoryScheduler:
@@ -70,7 +73,6 @@ class TrajectoryScheduler:
         feedback_timeout_sec: float = 0.5,
         max_dispatch_delay_sec: float = 1.0,
         batch_open_timeout_sec: float = 5.0,
-        relative_basis_max_error_deg: float = 5.0,
     ) -> None:
         if not math.isfinite(batch_wait_sec) or batch_wait_sec < 0.0:
             raise ValueError("batch_wait_sec must be finite and non-negative")
@@ -96,14 +98,14 @@ class TrajectoryScheduler:
                 "feedback_timeout_sec must be finite and non-negative"
             )
 
-        for value in (max_dispatch_delay_sec, batch_open_timeout_sec, relative_basis_max_error_deg):
+        for value in (max_dispatch_delay_sec, batch_open_timeout_sec):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError("safety parameters must be finite and positive")
         self._max_dispatch_delay_sec = max_dispatch_delay_sec
         self._batch_open_timeout_sec = batch_open_timeout_sec
-        self._relative_basis_max_error_rad = math.radians(relative_basis_max_error_deg)
-        self._explicit_opened_at = None
+        self._explicit_last_command_at = None
         self._last_error = ""
+        self._failure_details = ""
         self._stopped = False
         self._interrupting = False
         self._lock = threading.RLock()
@@ -113,7 +115,7 @@ class TrajectoryScheduler:
         self._feedback_positions_rad: dict[str, float] = {}
         self._feedback_revisions: dict[str, int] = {}
         self._feedback_updated_at: dict[str, float] = {}
-        self._successful_feedback_targets_rad: dict[str, float] = {}
+        self._commanded_targets_rad: dict[str, float] = {}
         self._feedback_revision = 0
         self._selected_mode = ExecutionMode.SERIAL
         self._startup_mode_window_open = True
@@ -121,6 +123,7 @@ class TrajectoryScheduler:
         self._building_deadline: float | None = None
         self._ready_batches: deque[_MotionBatch] = deque()
         self._in_flight: ScheduledTrajectory | None = None
+        self._completed_continuation: ScheduledTrajectory | None = None
         self._retry_trajectory: ScheduledTrajectory | None = None
         self._revision = 0
         self._next_batch_id = 0
@@ -144,7 +147,8 @@ class TrajectoryScheduler:
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
-            if self._explicit_opened_at is not None:
+            if self._explicit_last_command_at is not None:
+                self._explicit_last_command_at = current_time
                 return True
             # 旧HCI版ではfetchの完了を待っていなかった。OCSの実装と同様に、
             # 要求が逆順に届いた場合、最初の明示的なモードで未確定のバッチを引き継ぐ。
@@ -204,6 +208,8 @@ class TrajectoryScheduler:
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
+            if self._explicit_last_command_at is not None:
+                self._explicit_last_command_at = current_time
             self._stopped = False
             if self._building_batch is None:
                 self._next_batch_id += 1
@@ -214,7 +220,7 @@ class TrajectoryScheduler:
                 )
 
             if (
-                self._explicit_opened_at is None
+                self._explicit_last_command_at is None
                 and joint_name == "swing"
                 and self._building_batch.mode == ExecutionMode.PARALLEL
                 and any(
@@ -276,112 +282,125 @@ class TrajectoryScheduler:
         self,
         base_duration_sec: float = 3.0,
         now: float | None = None,
+        replacing: ScheduledTrajectory | None = None,
     ) -> ScheduledTrajectory | None:
-        if (
-            not is_ros_duration_safe(base_duration_sec)
-            or base_duration_sec <= 0.0
-        ):
-            raise ValueError(
-                "base_duration_sec must be positive and fit in ROS Duration"
-            )
+        if not is_ros_duration_safe(base_duration_sec) or base_duration_sec <= 0.0:
+            raise ValueError("base_duration_sec must be positive and fit in ROS Duration")
 
         current_time = time.monotonic() if now is None else now
         with self._lock:
             self._seal_expired_building_batch(current_time)
-            if self._in_flight is not None or not self._ready_batches:
+            if self._interrupting or not self._ready_batches:
                 return None
-            batch = self._ready_batches[0]
+            index = 0
+            if replacing is not None:
+                # commit 0の確定済み後続だけを先読みし、受理までは旧ゴールを保持する。
+                if self._in_flight != replacing or replacing.wait_stopped:
+                    return None
+                index = 1
+                if len(self._ready_batches) <= index:
+                    return None
+            elif self._in_flight is not None:
+                return None
+            batch = self._ready_batches[index]
             if batch.ready_at is not None and current_time - batch.ready_at > self._max_dispatch_delay_sec:
                 self.stop("stale")
                 return None
-            if any(
-                not self._feedback_is_fresh(http_name, current_time)
-                for http_name, _ in PID_JOINTS
-            ):
+            if any(not self._feedback_is_fresh(axis, current_time) for axis, _ in PID_JOINTS):
                 return None
-            if self._retry_trajectory is not None:
+            if replacing is None and self._retry_trajectory is not None:
                 retry = self._retry_trajectory
-                if not self._matches_ready_batch(retry):
-                    self._retry_trajectory = None
-                else:
-                    return self._build_retry_trajectory(
-                        retry,
-                        base_duration_sec,
-                    )
+                if self._matches_ready_batch(retry):
+                    return self._build_retry_trajectory(retry, base_duration_sec)
+                self._retry_trajectory = None
 
-            batch = self._ready_batches[0]
-            if batch.mode == ExecutionMode.SERIAL:
-                commands = (batch.commands[0],)
-            else:
-                commands = tuple(batch.commands)
-
-            commands_by_joint: dict[str, list[QueuedMotionCommand]] = {
-                http_name: [] for http_name, _ in PID_JOINTS
-            }
-            for command in commands:
-                commands_by_joint[command.joint_name].append(command)
-
-            positions_rad: list[float] = []
-            duration_sec = 0.0
-            pending_targets: list[PendingHttpTarget] = []
-            for http_name, _ in PID_JOINTS:
-                joint_commands = commands_by_joint[http_name]
-                if not joint_commands:
-                    positions_rad.append(self._relative_basis(http_name, self._feedback_positions_rad[http_name]))
-                    continue
-
-                current_position = self._feedback_positions_rad[http_name]
-                target_position = _resolve_target_position_rad(
-                    http_name,
-                    self._relative_basis(http_name, current_position),
-                    joint_commands,
-                )
-                positions_rad.append(target_position)
-
-                effective_command = joint_commands[-1]
-                required_duration = _required_duration_sec(
-                    http_name,
-                    joint_commands,
-                    target_position,
-                    current_position,
-                    base_duration_sec,
-                )
-                duration_sec = max(duration_sec, required_duration)
-                pending_targets.append(
-                    PendingHttpTarget(
-                        http_name=effective_command.http_name,
-                        degrees=math.degrees(target_position),
-                        revision=effective_command.revision,
-                    )
-                )
-
-            pending_targets.sort(key=lambda item: item.revision)
-            target = TrajectoryTargetSnapshot(
-                revision=max(command.revision for command in commands),
-                joint_names=tuple(ros_name for _, ros_name in PID_JOINTS),
-                positions_rad=tuple(positions_rad),
-                duration_sec=duration_sec,
-                pending_http_targets=tuple(pending_targets),
+            basis = tuple(
+                self._relative_basis(axis, self._feedback_positions_rad[axis])
+                for axis, _ in PID_JOINTS
             )
+            scheduled = self._plan_batch(batch, basis, base_duration_sec)
+            previous = replacing or self._completed_continuation
+            if previous is not None or not scheduled.wait_stopped:
+                following = None
+                if not scheduled.wait_stopped and len(self._ready_batches) > index + 1:
+                    following = self._plan_batch(
+                        self._ready_batches[index + 1],
+                        scheduled.target.positions_rad, base_duration_sec,
+                    )
+                if previous is not None or following is not None:
+                    slope = _segment_velocity(basis, scheduled.target)
+                    # 先読み済みの境界速度を引き継ぎ、未確定だった境界は新区間の速度で始める。
+                    start_velocity = (
+                        previous.end_velocities_rad_s or slope
+                    ) if previous else (0.0,) * len(PID_JOINTS)
+                    start_velocity = _boundary_velocity(start_velocity, slope)
+                    end_velocity = (
+                        _boundary_velocity(slope, _segment_velocity(
+                            scheduled.target.positions_rad, following.target,
+                        )) if following else (0.0,) * len(PID_JOINTS)
+                    )
+                    scheduled = replace(
+                        scheduled, start_positions_rad=basis,
+                        start_velocities_rad_s=start_velocity,
+                        end_velocities_rad_s=end_velocity,
+                    )
             self._next_dispatch_id += 1
-            return ScheduledTrajectory(
-                dispatch_id=self._next_dispatch_id,
-                batch_id=batch.batch_id,
-                execution_mode=batch.mode,
-                commands=commands,
-                target=target,
-                wait_stopped=batch.wait_stopped,
-                feedback_revisions=tuple(
-                    self._feedback_revisions[http_name]
-                    for http_name, _ in PID_JOINTS
-                ),
-            )
+            return replace(scheduled, dispatch_id=self._next_dispatch_id)
 
-    def mark_submitted(self, scheduled: ScheduledTrajectory) -> bool:
+    def _plan_batch(
+        self, batch: _MotionBatch, basis: tuple[float, ...], base_duration_sec: float,
+    ) -> ScheduledTrajectory:
+        commands = tuple(batch.commands[:1] if batch.mode == ExecutionMode.SERIAL else batch.commands)
+        positions = []
+        pending = []
+        duration = 0.0
+        for index, (axis, _) in enumerate(PID_JOINTS):
+            selected = [command for command in commands if command.joint_name == axis]
+            position = _resolve_target_position_rad(axis, basis[index], selected) if selected else basis[index]
+            positions.append(position)
+            if selected:
+                # 実測の追従遅れで再生時間まで延びないよう、指令目標間の距離で計画する。
+                duration = max(duration, _required_duration_sec(
+                    axis, selected, position, basis[index], base_duration_sec,
+                ))
+                pending.append(PendingHttpTarget(
+                    selected[-1].http_name, math.degrees(position), selected[-1].revision,
+                ))
+        target = TrajectoryTargetSnapshot(
+            revision=max(command.revision for command in commands),
+            joint_names=tuple(name for _, name in PID_JOINTS), positions_rad=tuple(positions),
+            duration_sec=duration,
+            pending_http_targets=tuple(sorted(pending, key=lambda item: item.revision)),
+        )
+        return ScheduledTrajectory(
+            dispatch_id=0, batch_id=batch.batch_id, execution_mode=batch.mode,
+            commands=commands, target=target, wait_stopped=batch.wait_stopped,
+            feedback_revisions=tuple(self._feedback_revisions[axis] for axis, _ in PID_JOINTS),
+        )
+
+    def mark_submitted(
+        self, scheduled: ScheduledTrajectory, replacing: ScheduledTrajectory | None = None,
+    ) -> bool:
         with self._lock:
+            if replacing is not None:
+                if self._in_flight != replacing or replacing.wait_stopped:
+                    return False
+                self._seal_expired_building_batch(time.monotonic())
+                if self._interrupting:
+                    # stop中に受理された置換ゴールもcancelし、終端までゲートを閉じる。
+                    self._in_flight = scheduled
+                    return True
+                if not self._matches_ready_batch(scheduled, index=1):
+                    return False
+                self.mark_completed(replacing, successful=True)
             if self._in_flight is not None or not self._matches_ready_batch(scheduled):
                 return False
             self._in_flight = scheduled
+            self._completed_continuation = None
+            # 到達判定と独立に送信した目標を保持し、未到達分を次区間へ持ち越す。
+            self._commanded_targets_rad = dict(zip(
+                (axis for axis, _ in PID_JOINTS), scheduled.target.positions_rad,
+            ))
         return True
 
     def mark_send_failed(self, scheduled: ScheduledTrajectory) -> bool:
@@ -426,8 +445,9 @@ class TrajectoryScheduler:
                     self._ready_batches[0].ready_at = time.monotonic() if now is None else now
                 return True
             if not successful:
-                self._last_error = reason
-                self._successful_feedback_targets_rad.clear()
+                self._record_failure(reason, scheduled)
+                self._commanded_targets_rad.clear()
+                self._completed_continuation = None
                 # 待機キューを破棄しても、HTTP reporterでは失敗が分かるようにする。
                 self._motion_failed = True
 
@@ -438,7 +458,7 @@ class TrajectoryScheduler:
                 self._ready_batches.clear()
                 self._building_batch = None
                 self._building_deadline = None
-                self._explicit_opened_at = None
+                self._explicit_last_command_at = None
                 self._in_flight = None
                 self._retry_trajectory = None
                 return True
@@ -447,29 +467,44 @@ class TrajectoryScheduler:
                 self._ready_batches.clear()
                 self._building_batch = None
                 self._building_deadline = None
-                self._explicit_opened_at = None
+                self._explicit_last_command_at = None
                 self._in_flight = None
                 self._retry_trajectory = None
                 return False
 
             batch = self._ready_batches[0]
-            for (http_name, _), target_position in (zip(
-                PID_JOINTS, scheduled.target.positions_rad,
-            ) if successful else ()):
-                # 実測値は保持し、成功目標だけを次の相対指令の候補として残す。
-                self._successful_feedback_targets_rad[http_name] = target_position
             if batch.mode == ExecutionMode.SERIAL:
                 batch.commands.pop(0)
             else:
                 batch.commands.clear()
             if not batch.commands:
                 self._ready_batches.popleft()
+            # 結果が境界タイマーより先に届いても、確定済み後続へ同じ速度を引き継ぐ。
+            self._completed_continuation = (
+                scheduled if successful and not scheduled.wait_stopped and self._ready_batches else None
+            )
             self._in_flight = None
             self._retry_trajectory = None
-            # 後続バッチも直列の次指令も、実行中ゴールの終端までは送信できない。
+            # 送信可能になった時刻から、後続の送信待ち期限を数える。
             if self._ready_batches:
                 self._ready_batches[0].ready_at = time.monotonic() if now is None else now
         return True
+
+    def targets_outside_tolerance(
+        self, targets_rad: dict[str, float], tolerance_rad: float,
+    ) -> dict[str, float]:
+        """JointStateと同じロックで比較し、追従許可の解除に一貫した実測を使う。"""
+        with self._lock:
+            remaining = {}
+            for axis, target in targets_rad.items():
+                measured = self._feedback_positions_rad[axis]
+                delta = target - measured
+                if axis == "swing":
+                    # 連続関節の同値角を未到達と誤判定して出力を許可し続けない。
+                    delta = (delta + math.pi) % (2 * math.pi) - math.pi
+                if abs(delta) > tolerance_rad:
+                    remaining[axis] = target
+            return remaining
 
     def missing_feedback_joint_names(
         self, now: float | None = None
@@ -509,11 +544,8 @@ class TrajectoryScheduler:
             return int(bool(self._building_batch or self._ready_batches or self._in_flight))
 
     def _relative_basis(self, joint: str, measured: float) -> float:
-        """小さな到達誤差の累積を防ぎ、大きなずれは実測に戻す。"""
-        target = self._successful_feedback_targets_rad.get(joint)
-        if target is not None and _position_error_rad(joint, target, measured) <= self._relative_basis_max_error_rad:
-            return target
-        return measured
+        """未到達分を失わないよう、停止・致命的失敗までは指令目標を使う。"""
+        return self._commanded_targets_rad.get(joint, measured)
 
     def needs_cancel(self) -> bool:
         with self._lock:
@@ -534,37 +566,87 @@ class TrajectoryScheduler:
     def stop(self, reason: str = "stopped", *, reset: bool = False) -> None:
         """送信待ちを破棄し、送信済みゴールの終端まではゲートを保持する。"""
         with self._lock:
+            if not reset and reason != "stopped":
+                self._record_failure(reason)
             self._ready_batches.clear()
             self._building_batch = None
             self._building_deadline = None
-            self._explicit_opened_at = None
+            self._explicit_last_command_at = None
             self._retry_trajectory = None
-            self._successful_feedback_targets_rad.clear()
+            self._commanded_targets_rad.clear()
+            self._completed_continuation = None
             self._interrupting = self._in_flight is not None
+            if reset:
+                self._last_error = ""
+                self._failure_details = ""
+            elif reason == "stopped":
+                if not self._last_error:
+                    self._last_error = reason
+            self._motion_failed = self._last_error not in ("", "stopped")
             self._stopped = not reset and reason == "stopped"
-            self._motion_failed = not reset and reason != "stopped"
-            self._last_error = "" if reset else reason
+
+    def touch_explicit_batch(self, now: float | None = None) -> None:
+        """速度設定もバッチ構築に必要なので、reporterとは分けて通信期限を更新する。"""
+        with self._lock:
+            current = time.monotonic() if now is None else now
+            self._seal_expired_building_batch(current)
+            if self._explicit_last_command_at is not None:
+                self._explicit_last_command_at = current
+
+    def _record_failure(self, reason: str, scheduled: ScheduledTrajectory | None = None) -> None:
+        # Scratchが失敗検知後にstopを送っても、resetまでは最初の原因を残す。
+        if self._last_error in ("", "stopped"):
+            self._last_error = reason
+            self._failure_details = self.goal_diagnostics(scheduled)
+
+    def motion_failure_details(self) -> str:
+        with self._lock:
+            return self._failure_details
+
+    def goal_diagnostics(self, scheduled: ScheduledTrajectory | None = None) -> str:
+        """実測を目標で上書きせず、失敗時の指令軸ごとの角度差を残す。"""
+        with self._lock:
+            scheduled = scheduled or self._in_flight
+            batch = self._building_batch or (self._ready_batches[0] if self._ready_batches else None)
+            commands = scheduled.commands if scheduled else (batch.commands if batch else ())
+            details = []
+            for i, (axis, _) in enumerate(PID_JOINTS):
+                selected = [c for c in commands if c.joint_name == axis]
+                if not selected:
+                    continue
+                measured = self._feedback_positions_rad.get(axis)
+                target = scheduled.target.positions_rad[i] if scheduled else (
+                    _resolve_target_position_rad(axis, self._relative_basis(axis, measured), selected)
+                    if measured is not None else None
+                )
+                def degrees(value):
+                    return "unavailable" if value is None else f"{math.degrees(value):.3f}"
+                delta = None if measured is None or target is None else (
+                    _shortest_angular_delta(target, measured) if axis == "swing" else target - measured
+                )
+                details.append(f"axis={axis} target_deg={degrees(target)} measured_deg={degrees(measured)} delta_deg={degrees(delta)}")
+            return "; ".join(details) or "axes=none"
 
     def begin(self, now: float | None = None) -> None:
         """明示バッチにはdebounceを適用しない。"""
         with self._lock:
             current = time.monotonic() if now is None else now
             self._seal_expired_building_batch(current)
-            if self._explicit_opened_at is None:
+            if self._explicit_last_command_at is None:
                 self._seal_building_batch(current)
             self._next_batch_id += 1
             self._building_batch = _MotionBatch(self._next_batch_id, ExecutionMode.PARALLEL, [])
-            self._explicit_opened_at = current
+            self._explicit_last_command_at = current
             self._stopped = False
 
     def commit(self, wait_stopped: bool, now: float | None = None) -> None:
         with self._lock:
             current = time.monotonic() if now is None else now
             self._seal_expired_building_batch(current)
-            if self._explicit_opened_at is None:
+            if self._explicit_last_command_at is None:
                 return
             self._building_batch.wait_stopped = wait_stopped
-            self._explicit_opened_at = None
+            self._explicit_last_command_at = None
             self._seal_building_batch(current)
 
     def check_deadlines(self, now: float | None = None) -> None:
@@ -641,10 +723,10 @@ class TrajectoryScheduler:
             ),
         )
 
-    def _matches_ready_batch(self, scheduled: ScheduledTrajectory) -> bool:
-        if not self._ready_batches:
+    def _matches_ready_batch(self, scheduled: ScheduledTrajectory, index: int = 0) -> bool:
+        if len(self._ready_batches) <= index:
             return False
-        batch = self._ready_batches[0]
+        batch = self._ready_batches[index]
         if (
             batch.batch_id != scheduled.batch_id
             or batch.mode != scheduled.execution_mode
@@ -667,8 +749,8 @@ class TrajectoryScheduler:
         return now <= updated_at or now - updated_at <= self._feedback_timeout_sec
 
     def _seal_expired_building_batch(self, now: float) -> None:
-        if self._explicit_opened_at is not None:
-            if now - self._explicit_opened_at >= self._batch_open_timeout_sec:
+        if self._explicit_last_command_at is not None:
+            if now - self._explicit_last_command_at > self._batch_open_timeout_sec:
                 self.stop("stale")
             return
         if (
@@ -847,3 +929,13 @@ def _position_error_rad(
     if http_name == "swing":
         return abs(_shortest_angular_delta(target_position_rad, current_position_rad))
     return abs(target_position_rad - current_position_rad)
+
+
+def _segment_velocity(start: tuple[float, ...], target: TrajectoryTargetSnapshot) -> tuple[float, ...]:
+    return tuple((end - begin) / target.duration_sec for begin, end in zip(start, target.positions_rad))
+
+
+def _boundary_velocity(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
+    # 反転・保持では停止し、同方向は両区間の小さい速度に制限して3次補間の行き過ぎを防ぐ。
+    return tuple(math.copysign(min(abs(a), abs(b)), a) if a * b > 0.0 else 0.0
+                 for a, b in zip(left, right))

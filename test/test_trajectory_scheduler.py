@@ -78,7 +78,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         )
         self.assertTrue(
             math.isclose(
-                arm_goal.target.positions_rad[1], math.radians(-80.0)
+                arm_goal.target.positions_rad[1], math.radians(-50.0)
             )
         )
         self.assertTrue(
@@ -209,7 +209,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertEqual(second.execution_mode, ExecutionMode.PARALLEL)
         self.assertEqual(len(second.commands), 1)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(100.0))
+            math.isclose(second.target.positions_rad[0], math.radians(200.0))
         )
 
     def test_startup_mode_adoption_closes_after_first_default_batch(self) -> None:
@@ -296,7 +296,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             math.isclose(goal.target.positions_rad[1], math.radians(-40.0))
         )
 
-    def test_serial_relative_commands_use_each_dispatch_position(self) -> None:
+    def test_serial_relative_commands_accumulate_from_commanded_target(self) -> None:
         scheduler = TrajectoryScheduler(batch_wait_sec=0.05)
         _feedback(scheduler, boom=-50.0)
         scheduler.set_execution_mode("serial", now=0.0)
@@ -320,7 +320,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert second is not None
         self.assertEqual(second.commands[0].degrees, 5.0)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[1], math.radians(-45.0))
+            math.isclose(second.target.positions_rad[1], math.radians(-55.0))
         )
 
     def test_relative_command_uses_latest_feedback_at_dispatch(self) -> None:
@@ -645,7 +645,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         assert second is not None
         self.assertEqual(len(second.commands), 1)
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(270.0))
+            math.isclose(second.target.positions_rad[0], math.radians(370.0))
         )
 
     def test_parallel_absolute_and_relative_swing_are_split(self) -> None:
@@ -674,7 +674,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         assert second is not None
         self.assertTrue(
-            math.isclose(second.target.positions_rad[0], math.radians(200.0))
+            math.isclose(second.target.positions_rad[0], math.radians(220.0))
         )
 
     def test_relative_swing_retry_preserves_unwrapped_target(self) -> None:
@@ -709,7 +709,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(successor)
         assert successor is not None
         self.assertTrue(
-            math.isclose(successor.target.positions_rad[0], math.radians(-185.0))
+            math.isclose(successor.target.positions_rad[0], math.radians(190.0))
         )
 
     def test_relative_target_is_clamped_before_duration_is_calculated(self) -> None:
@@ -840,7 +840,7 @@ class TrajectorySchedulerTest(unittest.TestCase):
             math.isclose(retry.target.positions_rad[1], math.radians(-60.0))
         )
         self.assertTrue(
-            math.isclose(retry.target.positions_rad[2], math.radians(100.0))
+            math.isclose(retry.target.positions_rad[2], math.radians(140.0))
         )
         self.assertTrue(math.isclose(retry.target.duration_sec, 2.6))
         self.assertTrue(scheduler.mark_submitted(retry))
@@ -850,10 +850,10 @@ class TrajectorySchedulerTest(unittest.TestCase):
         self.assertIsNotNone(successor)
         assert successor is not None
         self.assertTrue(
-            math.isclose(successor.target.positions_rad[1], math.radians(-42.0))
+            math.isclose(successor.target.positions_rad[1], math.radians(-55.0))
         )
         self.assertTrue(
-            math.isclose(successor.target.positions_rad[2], math.radians(100.0))
+            math.isclose(successor.target.positions_rad[2], math.radians(140.0))
         )
 
     def test_tolerance_failure_keeps_successors_and_measured_position(self) -> None:

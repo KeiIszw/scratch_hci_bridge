@@ -8,9 +8,13 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
+            # 未到達分を失わないよう、実測へ戻すrelative_basis_max_error_degは廃止した。
+            # 途中goalの猶予は後続がなく結果を待つ場合に使い、接続時刻には使わない。
             *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
                 ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0),
-                ("batch_open_timeout_sec", 5.0), ("relative_basis_max_error_deg", 5.0))],
+                ("batch_open_timeout_sec", 5.0),
+                ("intermediate_goal_time_tolerance_sec", 0.5))],
+            DeclareLaunchArgument("intermediate_tolerance_failure_fatal", default_value="false"),
             DeclareLaunchArgument("excavator", default_value="tb20e"),
             DeclareLaunchArgument("publish_hz", default_value="50.0"),
             DeclareLaunchArgument("http_host", default_value="0.0.0.0"),
@@ -57,6 +61,7 @@ def generate_launch_description() -> LaunchDescription:
                 "direct_joint_command_prefix", default_value="/TB20e"
             ),
             DeclareLaunchArgument("active_axis_mask_topic", default_value=""),
+            DeclareLaunchArgument("catch_up_axes_in_mask", default_value="true"),
             DeclareLaunchArgument("swing_unity_position_sign", default_value="-1.0"),
             DeclareLaunchArgument("boom_unity_position_sign", default_value="1.0"),
             DeclareLaunchArgument("arm_unity_position_sign", default_value="1.0"),
@@ -70,7 +75,11 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
                            for name in ("client_lease_sec", "max_dispatch_delay_sec",
-                                        "batch_open_timeout_sec", "relative_basis_max_error_deg")},
+                                        "batch_open_timeout_sec",
+                                        "intermediate_goal_time_tolerance_sec")},
+                        "intermediate_tolerance_failure_fatal": ParameterValue(
+                            LaunchConfiguration("intermediate_tolerance_failure_fatal"), value_type=bool
+                        ),
                         "excavator": LaunchConfiguration("excavator"),
                         "publish_hz": ParameterValue(
                             LaunchConfiguration("publish_hz"), value_type=float
@@ -150,6 +159,9 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "active_axis_mask_topic": LaunchConfiguration(
                             "active_axis_mask_topic"
+                        ),
+                        "catch_up_axes_in_mask": ParameterValue(
+                            LaunchConfiguration("catch_up_axes_in_mask"), value_type=bool
                         ),
                         "swing_unity_position_sign": ParameterValue(
                             LaunchConfiguration("swing_unity_position_sign"),

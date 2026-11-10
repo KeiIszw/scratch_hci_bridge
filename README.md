@@ -96,9 +96,11 @@ URLを`curl`で実行して確認してください。
 絶対関節命令は`cmd=<関節名>_angle&val=<絶対目標角度[deg]>`です。`swing`, `boom`,
 `arm`, `bucket`は、受理した角度を可動域内へ制限し、4軸をまとめてradへ変換して
 `FollowJointTrajectory` goalとして送ります。今回のHTTPバッチで指定されていない軸は、
-直前に成功したゴールの目標角度で保持します。ただし実測との誤差が
-`relative_basis_max_error_deg`を超える軸、またはstop/reset/失敗の後は最新の実測角度を使います。
-現在角度が揃う前に受信した命令は破棄せず保留し、実測値は成功目標で上書きしません。
+直前に指令したゴールの目標角度で保持します。相対指令も同じ目標角度を基準に加算します。
+実測との誤差の大きさや途中区間の非致命的な許容違反では基準を変えず、未到達分を次の目標へ含めます。
+stop/reset/致命的失敗の後と、まだ目標を送っていない軸は最新の実測角度を使います。
+`relative_basis_max_error_deg`はNode・launchとも廃止しました。既存の設定から削除してください。
+現在角度が揃う前に受信した命令は破棄せず保留し、実測値は指令目標で上書きしません。
 
 相対関節命令はOCS20250118と同じく、`val`の符号を無視して移動量の大きさ[deg]として
 使用します。方向はコマンド名で決まります。
@@ -154,8 +156,9 @@ TB20eのarm可動域は32--155 degreeです。絶対命令`arm=30`や、相対�
 まとめ、各軸を同時に開始します。同じバッチで同じ軸を複数回指定した場合は、最後の絶対角を
 使用します。相対命令は共通の基準角を原点として同じ軸の移動量を加算します。絶対・相対が
 混在した軸は「最後の絶対角 + 全相対移動量」を目標にします。厳密な命令順で同じ軸を段階的に
-動かす場合は`serial`を使用してください。実行中のgoalがある場合は、モードにかかわらず
-後続バッチをFIFOで待機させ、先行goalを新しいgoalで途中終了させません。
+動かす場合は`serial`を使用してください。後続バッチはFIFOで待機させます。
+明示的な`commit 0`のgoalだけは、確定済みの後続があれば計画時間の経過時に置き換えます。
+`commit 1`と暗黙バッチは、従来どおり先行goalの結果を待ちます。
 連続関節で左右方向を保証するため、同じparallelバッチに複数の`swing`系命令がある場合だけは
 到着順の個別goalへ自動分割します。`swing`の絶対角と`swing_left/right`の混在も同様です。
 
@@ -174,7 +177,9 @@ curl 'http://localhost:8899/?type=command&cmd=arm_retract&val=15'
 `trajectory_debounce_sec`だけ待ちます。
 
 Actionが拒否・中断・キャンセル・失敗した場合、serialの後続だけが動くことを防ぐため、
-待機中のPID関節命令を破棄します。選択中のモードは維持されるので、その後に受信した新しい
+待機中のPID関節命令を破棄します。例外として、明示バッチの`commit 0`で
+`GOAL_TOLERANCE_VIOLATED`になった場合は、既定で警告だけを出して後続を継続します。
+また、意図したgoal置き換えで届く旧goalの結果は失敗にしません。選択中のモードは維持されるので、その後に受信した新しい
 関節命令は実行できます。
 
 goal応答が`trajectory_goal_response_timeout_sec`を超えて返らない場合は、サーバ側で受理済みか
@@ -249,6 +254,8 @@ angular.z = (right - left) / 2 * drive_angular_scale
 | `initial_mode_command_wait_sec` | `0.5` | 最初の明示モードが遅着しても未確定バッチへ適用できる待ち時間[s] |
 | `joint_state_timeout_sec` | `0.5` | 相対角と未指定軸の基準に使えるfeedbackの最大経過時間[s]（`0`で監視無効） |
 | `trajectory_goal_tolerance_deg` | `0.75` | Action成功とみなす各PID関節の位置許容差[deg] |
+| `active_axis_mask_topic` | 空文字 | hardwareへ許可軸のbitmaskを送るtopic。空なら無効 |
+| `catch_up_axes_in_mask` | `true` | 指令軸に保持目標へ未到達の軸を加えて追従を継続する |
 | `trajectory_stopped_velocity_deg_s` | `0.5` | Action成功とみなす各PID関節の停止速度許容値[deg/s] |
 | `trajectory_goal_response_timeout_sec` | `5.0` | goal応答待ちの警告時間[s]（超過時は状態不明のためキューを閉じたまま保持） |
 | `trajectory_result_timeout_margin_sec` | `35.0` | 指定到達時間を超えてresultを待つ猶予[s]（超過後はcancel要求） |
@@ -300,9 +307,9 @@ colcon test-result --verbose
 ## Measured motion reporter
 
 GET /?type=reporter&cmd=motion_status&val=0 returns idle, busy, or failed.
-Busy includes batching, queued and running goals. Failure is latched until node restart.
+Busy includes batching, queued and running goals. Failure is latched until reset.
 This read-only endpoint is used by tb20e_motion_capture between measured segments.
-Scratch timeout stops subsequent commands but does not cancel an active Action.
+The generated Scratch timeout sends stop and requests cancellation of the active Action.
 
 
 ## Scratch同期と停止
@@ -314,13 +321,13 @@ Scratch timeout stops subsequent commands but does not cancel an active Action.
 | type | cmd | val | 動作 |
 |---|---|---|---|
 | command | begin | 0 | parallelの明示バッチを開く |
-| command | commit | 0 | 位置許容だけで完了（指令関節のvelocity許容は-1） |
+| command | commit | 0 | 確定済み後続があれば計画時間で置換。後続なしは位置許容だけで完了待ち（velocity許容は-1） |
 | command | commit | 1 | 位置許容と停止速度許容で完了 |
 | command | stop | 任意の有限数値 | 構築中・送信待ちを破棄し、走行を0、軸マスクを0、goalをcancel |
 | command | reset | 0 | stop相当の処理を行い、失敗・停止状態と理由を解除 |
 | reporter | heartbeat | 0 | `ok` を返し、リース監視を有効にする |
 | reporter | motion_status | 0 | `idle` / `busy` / `failed` / `stopped` |
-| reporter | motion_error | 0 | 最後の失敗理由（なければ空文字） |
+| reporter | motion_error | 0 | reset以降の最初の失敗理由（失敗なしのstopはstopped、理由なしは空文字） |
 
 明示バッチ内の `parallel` / `serial` は無視します。空バッチのcommitは何も送りません。
 開いたまま再びbeginした場合は、その未確定バッチを置き換えます。
@@ -332,24 +339,51 @@ stopのHTTP応答はcancel完了を待ちません。通常のstop後は終端re
 次の動作指令で解除します。resetも実行中goalの終端を待つ間は `busy` です。
 `failed` はresetまで保持します。理由は `lease_expired` / `stale` / `goal_rejected` /
 `goal_aborted` / `tolerance_violated` / `result_timeout` / `stopped` / 空文字です。
-既存互換のためgoal位置許容違反では既存の待ち列を継続しますが、失敗状態は保持します。
+失敗検知後にScratchからstopが届いても、`motion_error`と`failed`は最初の原因を保持します。
+stopだけで止めた場合は`stopped`、resetで理由を消去します。
+
+`commit 0`の`GOAL_TOLERANCE_VIOLATED`（Action status=ABORTED、code=-5）は、
+既定では`failed`にせず待ち列を続行します。`commit 1`、PATH許容違反、その他のABORTED、
+REJECTEDは失敗として待ち列を破棄します。
+`intermediate_tolerance_failure_fatal:=true`で途中ゴールの位置許容違反も失敗にできます。
+`commit 0`のgoalにだけ`intermediate_goal_time_tolerance_sec`（既定0.5秒）を設定し、
+軌道の予定終端後に位置許容差へ収まるまでの猶予を短くします。fatal=trueでも猶予は同じで、
+違反結果を警告にするか失敗にするかだけが変わります。
+`commit 1`、暗黙バッチ（parallel/serial、debounce・モード変更による確定）、
+開始姿勢の絶対角指令などはgoalの猶予を0（未設定）のままにしてcontroller既定を使います。
+Humbleのjoint_trajectory_controllerは正のgoal猶予で`constraints.goal_time`を上書きし、
+0なら既定を使うため、本パラメータを0にすると結果待ちの猶予はcontroller既定へ戻せます。
+確定済み後続がある場合の計画時間での置換は、この猶予やfatal設定には依存しません。
+後続なし・最後のcommit 0が結果を待つ場合の猶予として0.5秒の既定値を維持しています。
+警告・失敗ログには理由と指令軸ごとの`target_deg`、`measured_deg`、`delta_deg`を1行で出します。
+差は目標−実測（swingは最短角度差）です。未受信の実測は`unavailable`と表示します。
 
 heartbeat受信前はリース監視を行いません。一度有効になると、全HTTP GET要求
 （heartbeatやmotion_status、エラー応答になる要求も含む）がリースを更新します。
 バッチ構築中・送信待ち・goal実行中に通信が途絶するとstop相当の処理を行い、
 理由 `lease_expired` の `failed` にします。
-送信期限切れと明示バッチの開放期限切れは理由 `stale` です。
+送信期限切れと明示バッチの無通信期限切れは理由 `stale` です。
+明示バッチの期限は最後のbegin／指令（速度設定を含む）からの無通信時間が上限を超えたときです。
+1秒ごとに指令が届けば、beginからcommitまで5秒を超えても破棄しません。
+reporterやheartbeatはバッチの指令期限を更新しません。
 serialの2番目以降の指令は、直前の指令の終端から送信期限を数えます。
 
 | パラメータ | 既定値 | 意味 |
 |---|---|---|
 | client_lease_sec | 2.0 | heartbeatで有効化後の通信途絶許容秒数 |
 | max_dispatch_delay_sec | 1.0 | バッチ確定後の送信待ち上限秒数 |
-| batch_open_timeout_sec | 5.0 | beginからcommitまでの上限秒数 |
-| relative_basis_max_error_deg | 5.0 | 成功目標を相対基準に使える実測との差 |
+| batch_open_timeout_sec | 5.0 | 明示バッチへ最後に指令が届いてからの無通信許容秒数（超過で破棄） |
+| intermediate_tolerance_failure_fatal | false | commit 0のGOAL許容違反も致命的な失敗とする |
+| intermediate_goal_time_tolerance_sec | 0.5 | 結果待ちするcommit 0の終端後猶予[秒]。置換時刻には影響しない。0はcontroller既定 |
 
-追加パラメータは正の有限数値で、同名のlaunch引数から設定できます。
-相対指令は直前に成功した指令関節の目標角を基準とし、実測との差が上限を超える場合や
+`intermediate_goal_time_tolerance_sec`はROS Durationへ格納できる非負の有限数値
+（最大2147483647秒）、その他の数値の追加パラメータは正の有限数値、
+`intermediate_tolerance_failure_fatal`はboolで、同名のlaunch引数から設定できます。
+単体launchでは`intermediate_goal_time_tolerance_sec:=0.5`で設定できます。
+`tb20e_bringup`経由でも未指定時はこの既定値が適用され、既存の速度・位置許容差・停止速度の
+YAML転送経路は変わりません。ただしbringupのYAML読み取り対象にはこの新パラメータが
+含まれないため、`/**/scratch_hci_bridge.ros__parameters`に追加するだけでは転送されません。
+相対指令は直前に成功または継続扱いとなった指令関節の目標角を基準とし、実測との差が上限を超える場合や
 stop/reset/失敗後は実測角に戻します。実測JointState自体は目標値で上書きしません。
 HTTPはdaemonスレッドの `ThreadingHTTPServer` です。通常指令は接続受付順に適用し、
 stop/resetとreporterはその待ち列を通りません。stop/reset以前から待機していたHTTP指令も
@@ -362,6 +396,61 @@ cancel完了やネットワーク応答をそのロック内で待ちません�
 構築中（begin直後を含む）と確定済みの未送信バッチを数え、実行中のゴールは除きます。
 serialバッチに未送信の指令が残る場合は、そのバッチを1件として数えます。
 `motion_status`も併用し、failed/stopped/errorを確認してください。
-commit 0の後続バッチは、前のゴールの終端後、次のタイマー周期で送信対象になります。
-非指令軸も相対指令と同じ基準で保持します。直前に成功したゴールの目標角を使い、
-実測との誤差が`relative_basis_max_error_deg`を超える軸、またはstop/reset/失敗の後は実測角を使います。
+非指令軸も相対指令と同じく直前の指令目標で保持し、stop/reset/致命的失敗の後は実測角を使います。
+
+### 保持目標への追従と軸マスク
+
+`active_axis_mask_topic`（単体起動の既定は空、HTTP構成では
+`/TB20e_0/http_active_axis_mask`）は、hardwareがレバー出力を許可する軸を指定します。
+bit 0〜3は swing / boom / arm / bucket です。保持補正だけで無関係な軸を動かさないための
+実機の安全機構ですが、指令軸だけを許可すると、短い区間で別の軸のgoalへ置き換えた際に
+未到達の軸も停止してしまいます。
+
+`catch_up_axes_in_mask`（bool、既定`true`）では、goal送信時に「そのgoalの指令軸 ∪
+保持目標と最新実測の差が`trajectory_goal_tolerance_deg`を超える軸」を許可します。
+旋回差は±180度内の最短角度差です。未到達軸は別軸のgoalへの置換後も追従を続け、
+ノードのタイマー周期（`publish_hz`、既定50Hz）で許容内への到達を確認して解除します。
+現在のgoalで指令中の軸はそのgoalの終了まで許可し、終了後は未到達軸だけを残します。
+正常完了・非致命的な途中GOAL許容違反でも未到達軸の許可を維持します。
+一度到達して解除した軸は、実測の変化だけでは再許可しません。次のgoal送信時に再判定します。
+
+stop/reset、リース切れ、stale、致命的失敗、Actionタイムアウト、ノード終了では
+追従情報を消去してマスクを0にします。最後のActionが終わって追従許可だけが残っている場合も
+有効化済みのリース監視は継続します。idle時のタイマーはマスクを再送しないため、
+単独`replay_motion`のマスクを上書きしません。
+
+従来の指令軸だけの許可へ戻すには、単体launchで`catch_up_axes_in_mask:=false`、
+またはNode起動時のROSパラメータに`catch_up_axes_in_mask: false`を指定します。
+`tb20e_bringup`のYAML転送対象には含まれないため、controllers YAMLへの追記だけでは
+切り替わりません。今回はbringup側の変更を行っていません。
+
+### commit 0の区間接続
+
+実行中のcommit 0に確定済み後続がある場合、送信時刻から`time_from_start`が経過した最初の
+`_on_timer`で次のgoalを送ります。結果や`goal_time_tolerance`の猶予は待ちません。
+判定の遅れは通常のタイマー実行では最大1周期（既定`publish_hz=50`なら20ms）です。
+ROS通信・executor遅延・controller更新時間は別途加わります。後続が後から確定した場合は、
+計画時間が既に過ぎていれば次のタイマーで送信します。後続なし、commit 1、最後の区間は結果を待ちます。
+stop/reset、リース切れ、stale、cancel中は置換しません。新goalの応答待ちにstopした場合も、
+受理後の新goalへcancelを要求し、終端までゲートを閉じます。
+
+Humble JTCは新Actionの受理時に旧goalをpreemptし、旧goalへCANCELED（2.54.1ではcode=-1）を返します。
+新goal受理より前に旧resultが届く場合は一旦保留し、受理が確定した置換の旧resultは無視します。
+置換goalの拒否は致命的失敗とし、旧goalもcancelして終端を待ちます。
+置換の受理応答が通信例外で不明になった場合は停止し、再送ゲートを閉じたままにします。
+
+境界の位置は前の指令目標を使い、置換軌道には時刻0の始点と区間終点の位置・速度を指定します。
+Humbleの`interpolation_method: splines`では位置＋速度の点間は3次補間になります。
+区間速度は指令目標間の移動量÷区間時間です。既知の隣接区間が同方向なら両者の小さい速度を
+境界に与え、反転・保持・クランプで移動しない軸は0にします。先読みした前goalの終点速度を
+次goalの始点へ引き継ぎます。前goal送信時に後続が未知だった場合は、新区間速度で始めます。
+さらに次の区間が未知、またはcommit 1の終点は速度0です。最初のcommit 0も送信時に後続が
+既知なら速度付き2点を送り、境界へ向かう不要な減速を避けます。
+
+終点速度を指定するにはJTCの`allow_nonzero_velocity_at_trajectory_end: true`が必要です。
+インストール済みHumble 2.54.1は既定trueで、リポジトリのcontroller設定に上書きはありません。
+3次補間の区間内ピーク速度は区間平均速度を超える場合があります。加速度・ジャークの制限や、
+追従誤差が大きい場合の実機の連続性は、この接続処理だけでは保証しません。
+
+仕様根拠: [Humbleのpreemption](https://control.ros.org/humble/doc/ros2_controllers/joint_trajectory_controller/doc/userdoc.html#preemption-policy)、
+[3次補間と軌道置換](https://control.ros.org/humble/doc/ros2_controllers/joint_trajectory_controller/doc/trajectory.html)。

@@ -63,12 +63,28 @@ class ScratchHciBridge(Node):
         self._stop_pending = False
         self._lease_enabled = False
         self._last_http_at = time.monotonic()
+        self._mask_commanded_axes: set[str] = set()
+        self._mask_catch_up_targets: dict[str, float] = {}
+        self._last_active_axis_mask = 0
         for name, default in (("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0),
-                              ("batch_open_timeout_sec", 5.0), ("relative_basis_max_error_deg", 5.0)):
+                              ("batch_open_timeout_sec", 5.0)):
             self.declare_parameter(name, default)
         self._client_lease_sec = float(self.get_parameter("client_lease_sec").value)
         if not math.isfinite(self._client_lease_sec) or self._client_lease_sec <= 0:
             raise ValueError("client_lease_sec must be finite and positive")
+        self.declare_parameter("intermediate_tolerance_failure_fatal", False)
+        self._intermediate_tolerance_failure_fatal = self.get_parameter(
+            "intermediate_tolerance_failure_fatal"
+        ).value
+        self.declare_parameter("intermediate_goal_time_tolerance_sec", 0.5)
+        self._intermediate_goal_time_tolerance_sec = float(
+            self.get_parameter("intermediate_goal_time_tolerance_sec").value
+        )
+        if not is_ros_duration_safe(self._intermediate_goal_time_tolerance_sec):
+            raise ValueError(
+                "intermediate_goal_time_tolerance_sec must be finite, non-negative "
+                "and fit in ROS Duration"
+            )
         self.declare_parameter("excavator", "tb20e")
         self.declare_parameter("publish_hz", 50.0)
         self.declare_parameter("http_host", "0.0.0.0")
@@ -94,6 +110,8 @@ class ScratchHciBridge(Node):
         self.declare_parameter("unity_position_command_prefix", "/TB20e")
         self.declare_parameter("direct_joint_command_prefix", "/TB20e")
         self.declare_parameter("active_axis_mask_topic", "")
+        self.declare_parameter("catch_up_axes_in_mask", True)
+        self._catch_up_axes_in_mask = self.get_parameter("catch_up_axes_in_mask").value
         self.declare_parameter("swing_unity_position_sign", -1.0)
         self.declare_parameter("boom_unity_position_sign", 1.0)
         self.declare_parameter("arm_unity_position_sign", 1.0)
@@ -305,7 +323,7 @@ class ScratchHciBridge(Node):
             completion_tolerance_deg=self._trajectory_goal_tolerance_deg,
             feedback_timeout_sec=self._joint_state_timeout_sec,
             **{name: float(self.get_parameter(name).value) for name in
-               ("max_dispatch_delay_sec", "batch_open_timeout_sec", "relative_basis_max_error_deg")},
+               ("max_dispatch_delay_sec", "batch_open_timeout_sec")},
         )
         self._trajectory_client = ActionClient(
             self, FollowJointTrajectory, trajectory_action
@@ -322,6 +340,9 @@ class ScratchHciBridge(Node):
         self._active_goal_handle: Any | None = None
         self._active_goal_scheduled: ScheduledTrajectory | None = None
         self._goal_result_future: Any | None = None
+        self._active_goal_planned_end: float | None = None
+        self._replacement_previous: ScheduledTrajectory | None = None
+        self._replacement_deferred_result: tuple[Any, ScheduledTrajectory] | None = None
         self._active_goal_deadline: float | None = None
         self._active_cancel_future: Any | None = None
         self._active_cancel_requested = False
@@ -366,47 +387,53 @@ class ScratchHciBridge(Node):
 
     @_motion_serialized
     def _command_callback(self, command: str, value: float) -> None:
-        self.get_logger().info(f"HTTP command: {command}={value:g}")
-        if command in ("stop", "reset"):
-            self._stop_motion(reset=command == "reset")
-            return
-        if command == "begin":
-            self._trajectory_scheduler.begin()
-            return
-        if command == "commit":
-            self._trajectory_scheduler.commit(bool(value))
-            return
-        execution_mode = EXECUTION_MODE_COMMANDS.get(command)
-        if execution_mode is not None:
-            self._trajectory_scheduler.set_execution_mode(execution_mode)
-            self.get_logger().info(
-                f"Selected trajectory execution mode: {execution_mode.value}"
-            )
-            return
-        if command in ("left_crawler_speed", "right_crawler_speed"):
-            self._trajectory_scheduler.accept_motion()
-        relative_command = RELATIVE_JOINT_COMMANDS.get(command)
-        absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
-        if absolute_joint in DIRECT_JOINT_NAMES:
-            self._trajectory_scheduler.accept_motion()
-        if absolute_joint in PID_HTTP_JOINT_NAMES:
-            joint_name = absolute_joint
-        elif (
-            relative_command is not None
-            and relative_command.joint in PID_HTTP_JOINT_NAMES
-        ):
-            joint_name = relative_command.joint
-        else:
-            return
+        previous_error = self._trajectory_scheduler.motion_error()
+        try:
+            self.get_logger().info(f"HTTP command: {command}={value:g}")
+            if command in ("stop", "reset"):
+                self._stop_motion(reset=command == "reset")
+                return
+            if command == "begin":
+                self._trajectory_scheduler.begin()
+                return
+            if command == "commit":
+                self._trajectory_scheduler.commit(bool(value))
+                return
+            self._trajectory_scheduler.touch_explicit_batch()
+            execution_mode = EXECUTION_MODE_COMMANDS.get(command)
+            if execution_mode is not None:
+                self._trajectory_scheduler.set_execution_mode(execution_mode)
+                self.get_logger().info(
+                    f"Selected trajectory execution mode: {execution_mode.value}"
+                )
+                return
+            if command in ("left_crawler_speed", "right_crawler_speed"):
+                self._trajectory_scheduler.accept_motion()
+            relative_command = RELATIVE_JOINT_COMMANDS.get(command)
+            absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
+            if absolute_joint in DIRECT_JOINT_NAMES:
+                self._trajectory_scheduler.accept_motion()
+            if absolute_joint in PID_HTTP_JOINT_NAMES:
+                joint_name = absolute_joint
+            elif (
+                relative_command is not None
+                and relative_command.joint in PID_HTTP_JOINT_NAMES
+            ):
+                joint_name = relative_command.joint
+            else:
+                return
 
-        command_snapshot = self._state.snapshot()
-        self._trajectory_scheduler.update_http_target(
-            command,
-            value,
-            speed_limit_deg_s=(
-                command_snapshot.joint_speed_limits_deg_s[joint_name]
-            ),
-        )
+            command_snapshot = self._state.snapshot()
+            self._trajectory_scheduler.update_http_target(
+                command,
+                value,
+                speed_limit_deg_s=(
+                    command_snapshot.joint_speed_limits_deg_s[joint_name]
+                ),
+            )
+        finally:
+            # 遅着したcommit自身が期限切れを検出する場合も、最初の原因をログへ残す。
+            self._log_new_motion_failure(previous_error)
 
     def _joint_state_callback(self, message: JointState) -> None:
         self._trajectory_scheduler.update_from_joint_state(
@@ -419,9 +446,19 @@ class ScratchHciBridge(Node):
         if heartbeat:
             self._lease_enabled = True
 
+    def _log_new_motion_failure(self, previous_error: str) -> None:
+        error = self._trajectory_scheduler.motion_error()
+        if error not in ("", "stopped") and error != previous_error:
+            self._publish_active_axis_mask()
+            self.get_logger().error(
+                f"Motion failed: reason={error} {self._trajectory_scheduler.motion_failure_details()}"
+            )
+
     def _stop_motion(self, reason: str = "stopped", *, reset: bool = False) -> None:
         """HTTP応答は終端結果を待たず、cancelの要求だけを行う。"""
+        previous_error = self._trajectory_scheduler.motion_error()
         self._trajectory_scheduler.stop(reason, reset=reset)
+        self._log_new_motion_failure(previous_error)
         self._state.stop_drive()
         self._stop_pending = bool(self._goal_response_future or self._active_goal_handle)
         self._publish_active_axis_mask()
@@ -430,14 +467,18 @@ class ScratchHciBridge(Node):
     @_motion_serialized
     def _on_timer(self) -> None:
         now = time.monotonic()
-        if self._lease_enabled and now - self._last_http_at > self._client_lease_sec and self._trajectory_scheduler.has_work():
+        if (self._lease_enabled and now - self._last_http_at > self._client_lease_sec
+                and (self._trajectory_scheduler.has_work() or self._mask_catch_up_targets)):
             self._stop_motion("lease_expired")
+        previous_error = self._trajectory_scheduler.motion_error()
         self._trajectory_scheduler.check_deadlines(now)
+        self._log_new_motion_failure(previous_error)
         if self._trajectory_scheduler.needs_cancel() and not self._stop_pending:
             self._stop_motion(self._trajectory_scheduler.motion_error())
         self._publish_drive_and_direct_commands()
         self._check_action_timeouts()
         self._send_pending_trajectory()
+        self._refresh_active_axis_mask()
 
     def _publish_drive_and_direct_commands(self) -> None:
         frame = self._state.next_frame()
@@ -453,8 +494,20 @@ class ScratchHciBridge(Node):
             publisher.publish(message)
 
     def _send_pending_trajectory(self) -> None:
+        if self._goal_response_future is not None or self._stop_pending:
+            return
+        replacing = None
+        if self._active_goal_handle is not None:
+            if (self._active_goal_scheduled is None
+                    or self._active_goal_scheduled.wait_stopped
+                    or self._active_cancel_requested
+                    or self._active_goal_planned_end is None
+                    or time.monotonic() < self._active_goal_planned_end):
+                return
+            replacing = self._active_goal_scheduled
         scheduled = self._trajectory_scheduler.pending_snapshot(
             base_duration_sec=self._trajectory_duration_sec,
+            replacing=replacing,
         )
         if scheduled is None:
             missing = self._trajectory_scheduler.missing_feedback_joint_names()
@@ -480,6 +533,12 @@ class ScratchHciBridge(Node):
 
         self._action_server_unavailable_reported = False
         goal = FollowJointTrajectory.Goal()
+        if not scheduled.wait_stopped:
+            # 途中区間でcontroller既定の長い猶予を毎回待たないようにする。
+            # fatalは結果の扱いだけを切り替えるため、猶予は同じ値を使う。
+            goal.goal_time_tolerance = Duration(
+                seconds=self._intermediate_goal_time_tolerance_sec
+            ).to_msg()
         goal.trajectory.joint_names = list(target.joint_names)
         commanded_ros_joints = {
             ros_name
@@ -512,6 +571,13 @@ class ScratchHciBridge(Node):
             seconds=target.duration_sec
         ).to_msg()
         goal.trajectory.points = [point]
+        if scheduled.start_positions_rad:
+            # t=0の指令位置と速度を明示し、実測からの補間による境界の後戻りを避ける。
+            start = JointTrajectoryPoint()
+            start.positions = list(scheduled.start_positions_rad)
+            start.velocities = list(scheduled.start_velocities_rad_s)
+            point.velocities = list(scheduled.end_velocities_rad_s)
+            goal.trajectory.points = [start, point]
 
         updated_names = ",".join(
             pending.http_name for pending in target.pending_http_targets
@@ -526,20 +592,28 @@ class ScratchHciBridge(Node):
             f"duration={target.duration_sec:.3f}s): {target_summary}"
         )
 
-        if not self._trajectory_scheduler.mark_submitted(scheduled):
+        if replacing is None and not self._trajectory_scheduler.mark_submitted(scheduled):
             self.get_logger().error(
                 "Trajectory queue changed before the goal could be tracked"
             )
             return
+        previous_mask_axes = self._mask_commanded_axes.copy()
+        previous_catch_up_targets = self._mask_catch_up_targets.copy()
         self._publish_active_axis_mask(scheduled)
         try:
             future = self._trajectory_client.send_goal_async(goal)
         except Exception as exception:
-            self._trajectory_scheduler.mark_send_failed(scheduled)
+            if replacing is None:
+                self._trajectory_scheduler.mark_send_failed(scheduled)
             self._stop_pending = False
-            self._publish_active_axis_mask()
+            # 送信自体が失敗した置換では旧goalが動いているため、その追従許可を戻す。
+            self._mask_commanded_axes = previous_mask_axes
+            self._mask_catch_up_targets = previous_catch_up_targets
+            self._refresh_active_axis_mask()
             self.get_logger().error(f"Failed to send trajectory goal: {exception}")
             return
+        self._replacement_previous = replacing
+        self._replacement_deferred_result = None
         self._goal_response_future = future
         self._goal_response_scheduled = scheduled
         self._goal_submission_started_at = time.monotonic()
@@ -575,22 +649,47 @@ class ScratchHciBridge(Node):
     def _publish_active_axis_mask(
         self, scheduled: ScheduledTrajectory | None = None
     ) -> None:
-        """Permit hardware output only for joints commanded by this goal."""
+        # マスクは保持補正で無関係な軸を動かさないための実機側の出力制限である。
+        # 区間置換で未到達軸まで止めないよう、指令軸に保持目標への追従軸を加える。
         publisher = getattr(self, "_active_axis_mask_publisher", None)
         if publisher is None:
             return
-        active_joints = (
+        self._mask_commanded_axes = (
             {command.joint_name for command in scheduled.commands}
             if scheduled is not None
             else set()
         )
+        self._mask_catch_up_targets = (
+            self._trajectory_scheduler.targets_outside_tolerance(dict(zip(
+                (axis for axis, _ in PID_JOINTS), scheduled.target.positions_rad,
+            )), self._trajectory_goal_tolerance_rad)
+            if scheduled is not None and self._catch_up_axes_in_mask else {}
+        )
+        self._write_active_axis_mask()
+
+    def _refresh_active_axis_mask(self) -> None:
+        if getattr(self, "_active_axis_mask_publisher", None) is None:
+            return
+        # 一度到達した軸は次の指令まで再許可せず、無関係な保持補正を再開しない。
+        if self._mask_catch_up_targets:
+            self._mask_catch_up_targets = self._trajectory_scheduler.targets_outside_tolerance(
+                self._mask_catch_up_targets, self._trajectory_goal_tolerance_rad,
+            )
+        self._write_active_axis_mask(only_if_changed=True)
+
+    def _write_active_axis_mask(self, *, only_if_changed: bool = False) -> None:
+        active_joints = self._mask_commanded_axes | self._mask_catch_up_targets.keys()
         mask = 0
         for bit, (http_name, _) in enumerate(PID_JOINTS):
             if http_name in active_joints:
                 mask |= 1 << bit
+        # idle時の再publishで、単独replayが所有するマスクを上書きしない。
+        if only_if_changed and mask == self._last_active_axis_mask:
+            return
+        self._last_active_axis_mask = mask
         message = UInt8()
         message.data = mask
-        publisher.publish(message)
+        self._active_axis_mask_publisher.publish(message)
 
     @_motion_serialized
     def _goal_response_callback(
@@ -606,6 +705,10 @@ class ScratchHciBridge(Node):
             return
 
         submission_started_at = self._goal_submission_started_at
+        replacing = self._replacement_previous
+        self._replacement_previous = None
+        deferred_result = self._replacement_deferred_result
+        self._replacement_deferred_result = None
         self._goal_response_future = None
         self._goal_response_scheduled = None
         self._goal_submission_started_at = None
@@ -613,36 +716,56 @@ class ScratchHciBridge(Node):
         try:
             goal_handle = future.result()
         except Exception as exception:
-            self._trajectory_scheduler.mark_send_failed(scheduled)
-            self._stop_pending = False
-            self._publish_active_axis_mask()
+            if replacing is not None:
+                # 新ゴールの受理が不明なので、旧ゴールを止めても再送のゲートは開けない。
+                self._goal_response_future = future
+                self._goal_response_scheduled = scheduled
+                self._goal_submission_started_at = submission_started_at
+                self._goal_response_timeout_reported = True
+                self._stop_motion("result_timeout")
+            else:
+                self._trajectory_scheduler.mark_send_failed(scheduled)
+                self._stop_pending = False
+                # 再送可能な通信失敗では、既に送った目標への追従許可を失わせない。
+                self._mask_commanded_axes.clear()
+                self._refresh_active_axis_mask()
             self.get_logger().error(f"Failed to send trajectory goal: {exception}")
             return
 
         if not goal_handle.accepted:
-            self._stop_pending = False
-            self._trajectory_scheduler.mark_completed(
-                scheduled, successful=False, reason="goal_rejected"
-            )
+            if replacing is not None:
+                # 拒否だけでは旧ゴールは止まらないため、cancelと終端待ちを維持する。
+                self._stop_motion("goal_rejected")
+                if deferred_result is not None:
+                    self._goal_result_callback(*deferred_result)
+            else:
+                self._stop_pending = False
+                self._trajectory_scheduler.mark_completed(
+                    scheduled, successful=False, reason="goal_rejected"
+                )
             self._publish_active_axis_mask()
             self.get_logger().error(
-                "Trajectory goal was rejected; cleared queued trajectory commands"
+                "Trajectory goal was rejected; reason=goal_rejected "
+                + self._trajectory_scheduler.goal_diagnostics(scheduled)
             )
             return
 
+        if replacing is not None:
+            self._trajectory_scheduler.mark_submitted(scheduled, replacing=replacing)
         self._active_goal_handle = goal_handle
         self._active_goal_scheduled = scheduled
         self._active_cancel_future = None
         self._active_cancel_requested = False
         self._active_cancel_retry_at = None
+        if replacing is not None and self._trajectory_scheduler.needs_cancel():
+            self._stop_motion(self._trajectory_scheduler.motion_error())
         if not getattr(self, "_stop_pending", False):
             self._publish_unity_position_target(scheduled)
         if submission_started_at is None:
             submission_started_at = time.monotonic()
+        self._active_goal_planned_end = submission_started_at + scheduled.target.duration_sec
         self._active_goal_deadline = (
-            submission_started_at
-            + scheduled.target.duration_sec
-            + self._trajectory_result_timeout_margin_sec
+            self._active_goal_planned_end + self._trajectory_result_timeout_margin_sec
         )
         self.get_logger().info("Trajectory goal accepted")
         try:
@@ -674,6 +797,11 @@ class ScratchHciBridge(Node):
             )
             return
 
+        if self._replacement_previous is scheduled:
+            # JTCの旧resultは新goalの応答より先にも届くため、受理が確定するまで保留する。
+            self._replacement_deferred_result = (future, scheduled)
+            return
+
         try:
             wrapped_result = future.result()
         except Exception as exception:
@@ -690,38 +818,43 @@ class ScratchHciBridge(Node):
             and wrapped_result.result.error_code
             == FollowJointTrajectory.Result.SUCCESSFUL
         )
-        preserve_queued = (
-            wrapped_result.status == GoalStatus.STATUS_ABORTED
+        intermediate_tolerance = (
+            not scheduled.wait_stopped
+            and not self._intermediate_tolerance_failure_fatal
+            and wrapped_result.status == GoalStatus.STATUS_ABORTED
             and wrapped_result.result.error_code
             == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED
         )
+        reason = ("tolerance_violated" if wrapped_result.result.error_code in (
+            FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+            FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
+        ) else "goal_aborted")
+        diagnostics = self._trajectory_scheduler.goal_diagnostics(scheduled)
         self._clear_active_goal_tracking()
         self._stop_pending = False
+        # 途中目標の未到達分を次区間で取り戻せるよう、指令基準を保って先へ進む。
         self._trajectory_scheduler.mark_completed(
-            scheduled, successful=successful, preserve_queued=preserve_queued,
-            reason=("tolerance_violated" if wrapped_result.result.error_code in (
-                FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
-                FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
-            ) else "goal_aborted")
+            scheduled, successful=successful or intermediate_tolerance, reason=reason
         )
-        self._publish_active_axis_mask()
+        if successful or intermediate_tolerance:
+            self._mask_commanded_axes.clear()
+            self._refresh_active_axis_mask()
+        else:
+            self._publish_active_axis_mask()
         if successful:
             self.get_logger().info(
                 f"Completed {scheduled.execution_mode.value} trajectory goal"
             )
             return
-
-        queue_action = (
-            "continuing queued trajectory commands"
-            if preserve_queued
-            else "cleared queued trajectory commands"
-        )
-        self.get_logger().error(
-            f"Trajectory failed; {queue_action}: "
-            f"status={wrapped_result.status} "
+        message = (
+            f"reason={reason} {diagnostics} status={wrapped_result.status} "
             f"code={wrapped_result.result.error_code} "
-            f"message={wrapped_result.result.error_string}"
+            "message=" + " ".join(wrapped_result.result.error_string.splitlines())
         )
+        if intermediate_tolerance:
+            self.get_logger().warning("Intermediate trajectory tolerance exceeded; continuing queued commands: " + message)
+        else:
+            self.get_logger().error("Trajectory failed; cleared queued trajectory commands: " + message)
 
     def _check_action_timeouts(self, now: float | None = None) -> None:
         current_time = time.monotonic() if now is None else now
@@ -828,6 +961,7 @@ class ScratchHciBridge(Node):
         self._active_goal_scheduled = None
         self._goal_result_future = None
         self._active_goal_deadline = None
+        self._active_goal_planned_end = None
         self._active_cancel_future = None
         self._active_cancel_requested = False
         self._active_cancel_retry_at = None
