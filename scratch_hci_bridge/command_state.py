@@ -1,9 +1,9 @@
+"""HTTP指令の名前・値を検査し、直接出力用の状態を保持する。"""
 from __future__ import annotations
 
 import math
 import threading
 from dataclasses import dataclass
-from enum import Enum
 
 
 JOINT_NAMES = ("blade", "body", "swing", "boom", "arm", "bucket", "thumb")
@@ -17,16 +17,6 @@ JOINT_SPEED_COMMANDS = {
 MAX_ROS_DURATION_SEC = float((1 << 31) - 1)
 _MAX_PID_JOINT_TRAVEL_DEG = 360.0
 MAX_RELATIVE_SWING_DEG = 180.0
-
-
-class ExecutionMode(str, Enum):
-    SERIAL = "serial"
-    PARALLEL = "parallel"
-
-
-EXECUTION_MODE_COMMANDS = {
-    mode.value: mode for mode in ExecutionMode
-}
 
 
 @dataclass(frozen=True)
@@ -70,11 +60,10 @@ JOINT_LIMITS_DEG = {
 }
 
 SUPPORTED_COMMANDS = (
-    frozenset(ABSOLUTE_JOINT_COMMANDS)
+        frozenset(ABSOLUTE_JOINT_COMMANDS)
     | frozenset(JOINT_SPEED_COMMANDS)
-    | frozenset(EXECUTION_MODE_COMMANDS)
     | frozenset(RELATIVE_JOINT_COMMANDS)
-    | frozenset(("left_crawler_speed", "right_crawler_speed", "stop", "reset", "begin", "commit"))
+    | frozenset(("left_crawler_speed", "right_crawler_speed", "stop", "reset", "barrier"))
 )
 
 
@@ -82,7 +71,6 @@ SUPPORTED_COMMANDS = (
 class CommandSnapshot:
     joints_deg: dict[str, float]
     joint_speed_limits_deg_s: dict[str, float | None]
-    execution_mode: ExecutionMode
     left_crawler_speed: float
     right_crawler_speed: float
 
@@ -120,7 +108,6 @@ class CommandState:
             ):
                 raise ValueError(f"{joint} default speed must be non-negative and fit ROS Duration")
             self._joint_speed_limits_deg_s[joint] = speed if speed > 0.0 else None
-        self._execution_mode = ExecutionMode.SERIAL
         self._left_crawler_speed = 0.0
         self._right_crawler_speed = 0.0
         self._drive_linear_scale = drive_linear_scale
@@ -129,16 +116,15 @@ class CommandState:
     def apply_command(self, command: str, value: float) -> bool:
         if not math.isfinite(value):
             return False
-        if command in ("stop", "reset", "begin", "commit"):
-            return command != "commit" or value in (0, 1)
+        if command in ("stop", "reset", "barrier"):
+            return True
         with self._lock:
             joint = ABSOLUTE_JOINT_COMMANDS.get(command)
             if joint is not None:
                 self._joints_deg[joint] = _clamp_joint(joint, value)
                 return True
             if command in RELATIVE_JOINT_COMMANDS:
-                # 相対PID目標は、バッチ送信時にTrajectorySchedulerが
-                # 最新の関節フィードバックを使って解決する。
+                # 相対PID目標はタイムラインの直前目標を基準に解決する。
                 return is_safe_relative_swing_command(command, value)
             speed_joint = JOINT_SPEED_COMMANDS.get(command)
             if speed_joint is not None:
@@ -149,12 +135,6 @@ class CommandState:
                 self._joint_speed_limits_deg_s[speed_joint] = (
                     value if value > 0.0 else None
                 )
-                return True
-            execution_mode = EXECUTION_MODE_COMMANDS.get(command)
-            if execution_mode is not None:
-                # HCIブロックは常にvalを渡すが、モード指令では共通のHTTP形式に
-                # 合わせるためだけに使用する。
-                self._execution_mode = execution_mode
                 return True
             if command == "left_crawler_speed":
                 if not self._drive_is_finite(value, self._right_crawler_speed):
@@ -191,7 +171,6 @@ class CommandState:
             return CommandSnapshot(
                 joints_deg=dict(self._joints_deg),
                 joint_speed_limits_deg_s=dict(self._joint_speed_limits_deg_s),
-                execution_mode=self._execution_mode,
                 left_crawler_speed=self._left_crawler_speed,
                 right_crawler_speed=self._right_crawler_speed,
             )

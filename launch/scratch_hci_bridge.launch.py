@@ -1,3 +1,4 @@
+"""関節タイムラインと安全停止のパラメータを公開する。"""
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -8,13 +9,8 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
-            # 未到達分を失わないよう、実測へ戻すrelative_basis_max_error_degは廃止した。
-            # 途中goalの猶予は後続がなく結果を待つ場合に使い、接続時刻には使わない。
             *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
-                ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0),
-                ("batch_open_timeout_sec", 5.0),
-                ("intermediate_goal_time_tolerance_sec", 0.5))],
-            DeclareLaunchArgument("intermediate_tolerance_failure_fatal", default_value="false"),
+                ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0))],
             DeclareLaunchArgument("excavator", default_value="tb20e"),
             DeclareLaunchArgument("publish_hz", default_value="50.0"),
             DeclareLaunchArgument("http_host", default_value="0.0.0.0"),
@@ -31,10 +27,6 @@ def generate_launch_description() -> LaunchDescription:
                 for joint in ("swing", "boom", "arm", "bucket")
             ],
             DeclareLaunchArgument("trajectory_duration_sec", default_value="3.0"),
-            DeclareLaunchArgument("trajectory_debounce_sec", default_value="0.5"),
-            DeclareLaunchArgument(
-                "initial_mode_command_wait_sec", default_value="0.5"
-            ),
             DeclareLaunchArgument("joint_state_timeout_sec", default_value="0.5"),
             DeclareLaunchArgument(
                 "trajectory_goal_tolerance_deg", default_value="0.75"
@@ -74,12 +66,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
-                           for name in ("client_lease_sec", "max_dispatch_delay_sec",
-                                        "batch_open_timeout_sec",
-                                        "intermediate_goal_time_tolerance_sec")},
-                        "intermediate_tolerance_failure_fatal": ParameterValue(
-                            LaunchConfiguration("intermediate_tolerance_failure_fatal"), value_type=bool
-                        ),
+                           for name in ("client_lease_sec", "max_dispatch_delay_sec")},
                         "excavator": LaunchConfiguration("excavator"),
                         "publish_hz": ParameterValue(
                             LaunchConfiguration("publish_hz"), value_type=float
@@ -105,14 +92,6 @@ def generate_launch_description() -> LaunchDescription:
                         },
                         "trajectory_duration_sec": ParameterValue(
                             LaunchConfiguration("trajectory_duration_sec"),
-                            value_type=float,
-                        ),
-                        "trajectory_debounce_sec": ParameterValue(
-                            LaunchConfiguration("trajectory_debounce_sec"),
-                            value_type=float,
-                        ),
-                        "initial_mode_command_wait_sec": ParameterValue(
-                            LaunchConfiguration("initial_mode_command_wait_sec"),
                             value_type=float,
                         ),
                         "joint_state_timeout_sec": ParameterValue(

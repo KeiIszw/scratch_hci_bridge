@@ -1,9 +1,9 @@
+"""HTTP指令の値検査と既存・追加コマンドの互換性を検証する。"""
 import math
 import unittest
 
 from scratch_hci_bridge.command_state import (
     CommandState,
-    ExecutionMode,
     JOINT_NAMES,
     MAX_ROS_DURATION_SEC,
     RELATIVE_JOINT_COMMANDS,
@@ -97,14 +97,6 @@ class CommandStateTest(unittest.TestCase):
         self.assertTrue(is_ros_duration_safe(MAX_ROS_DURATION_SEC))
         self.assertFalse(is_ros_duration_safe(MAX_ROS_DURATION_SEC + 1.0))
 
-    def test_execution_mode_defaults_to_serial_and_ignores_dummy_value(self) -> None:
-        state = CommandState()
-
-        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.SERIAL)
-        self.assertTrue(state.apply_command("parallel", 123.0))
-        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.PARALLEL)
-        self.assertTrue(state.apply_command("serial", -456.0))
-        self.assertEqual(state.snapshot().execution_mode, ExecutionMode.SERIAL)
 
     def test_relative_joint_command_is_accepted_without_precomputing_target(self) -> None:
         state = CommandState()
@@ -154,8 +146,6 @@ class CommandStateTest(unittest.TestCase):
             "boom_speed",
             "arm_speed",
             "bucket_speed",
-            "serial",
-            "parallel",
             "swing_left",
             "swing_right",
             "boom_up",
@@ -167,7 +157,7 @@ class CommandStateTest(unittest.TestCase):
             "left_crawler_speed",
             "right_crawler_speed",
         }
-        expected_commands.update(("stop", "reset", "begin", "commit"))
+        expected_commands.update(("stop", "reset", "barrier"))
         self.assertEqual(SUPPORTED_COMMANDS, expected_commands)
 
         joint_commands = {

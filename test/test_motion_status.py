@@ -8,12 +8,12 @@ from scratch_hci_bridge.trajectory_scheduler import TrajectoryScheduler
 
 class MotionStatusTest(unittest.TestCase):
     def test_building_running_and_failure(self):
-        s=TrajectoryScheduler(batch_wait_sec=0,initial_mode_command_wait_sec=0)
+        s=TrajectoryScheduler()
         self.assertEqual(s.motion_status(),0)
-        s.update_http_target('boom_angle',-50,now=1)
+        s.update_http_target('boom_angle',-50,base_duration_sec=1,now=1)
         self.assertEqual(s.motion_status(),1)
         s.update_from_joint_state(['swing_joint','boom_joint','arm_joint','bucket_joint'],[0,-1,2,1],now=1)
-        goal=s.pending_snapshot(base_duration_sec=1,now=1)
+        goal=s.pending_snapshot(now=1)
         self.assertIsNotNone(goal)
         self.assertTrue(s.mark_submitted(goal))
         self.assertEqual(s.motion_status(),1)

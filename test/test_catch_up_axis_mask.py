@@ -7,10 +7,10 @@ from action_msgs.msg import GoalStatus
 from control_msgs.action import FollowJointTrajectory
 
 from scratch_hci_bridge.node import ScratchHciBridge
-from test_goal_time_tolerance import _BeforeRosInterfaces, _initialize_without_ros
+from bridge_test_helpers import _BeforeRosInterfaces, _initialize_without_ros
 from test_node_command_callback import _Publisher
 from test_sync_safety import NAMES, scheduler
-from test_trajectory_chaining import Harness, queue
+from bridge_test_helpers import Harness, queue
 
 
 def harness(enabled=True):
@@ -79,18 +79,13 @@ def test_multiple_catch_up_axes_survive_further_replacement_and_expire_independe
 
 
 @pytest.mark.parametrize('enabled', [True, False])
-@pytest.mark.parametrize('intermediate', [True, False])
-def test_completion_preserves_only_catch_up_axes_until_measured_arrival(enabled, intermediate):
+def test_completion_preserves_only_catch_up_axes_until_measured_arrival(enabled):
     h = harness(enabled)
     replace_with_bucket(h)
     # bucketは到達済みだが、boomは前goalの保持目標へまだ追従している。
     target = h.bridge._active_goal_scheduled.target.positions_rad
     feedback(h, now=1.1, bucket=target[3])
-    if intermediate:
-        h.result(1, GoalStatus.STATUS_ABORTED,
-                 FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED, now=1.1)
-    else:
-        h.result(1, now=1.1)
+    h.result(1, now=2)
     assert not h.scheduler.has_work()
     assert mask(h) == (0b0010 if enabled else 0)
     feedback(h, boom=-40.5, now=1.12, bucket=target[3])
@@ -113,8 +108,8 @@ def test_stop_paths_clear_catch_up_and_late_result_does_not_restore_mask(stop):
         h.result(1, GoalStatus.STATUS_ABORTED,
                  FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED, now=1.1)
     elif stop == 'stale':
-        h.scheduler.begin(now=1)
-        h.tick(6.01)
+        h.scheduler._feedback_timeout_sec = .5
+        h.tick(1.01)
     else:
         h.bridge._active_goal_deadline = 1.1
         h.tick(1.1)
@@ -131,8 +126,7 @@ def test_lease_also_stops_catch_up_after_last_action_completed():
     queue(h.scheduler)
     h.tick(0)
     h.accept(0)
-    h.result(0, GoalStatus.STATUS_ABORTED,
-             FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED, now=1)
+    h.result(0, now=1)
     assert not h.scheduler.has_work()
     assert mask(h) == 0b0010
     h.bridge._lease_enabled = True
@@ -199,7 +193,8 @@ def test_send_exception_during_replacement_keeps_old_goal_permission():
     h.accept(0)
     h.bridge._trajectory_client.send_goal_async.side_effect = RuntimeError('dummy send failure')
     h.tick(1)
-    assert mask(h) == 0b0010
+    # 旧goalも先行送信済みのbucket区間を含むため、開始時刻で出力を許可する。
+    assert mask(h) == 0b1010
     assert h.bridge._mask_catch_up_targets == {'boom': pytest.approx(math.radians(-40))}
 
 

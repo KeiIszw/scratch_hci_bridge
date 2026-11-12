@@ -1,3 +1,4 @@
+"""ダミーROS境界で指令の転送とActionの状態遷移を検証する。"""
 import importlib.util
 import unittest
 from types import SimpleNamespace
@@ -34,9 +35,6 @@ class _Scheduler:
     def goal_diagnostics(self, scheduled=None):
         return 'axis=boom target_deg=-40.000 measured_deg=-41.000 delta_deg=1.000'
 
-    def touch_explicit_batch(self):
-        pass
-
     def stop(self, reason="stopped", *, reset=False):
         self.stop_reason = reason
 
@@ -45,6 +43,7 @@ class _Scheduler:
         command: str,
         degrees: float,
         speed_limit_deg_s: float | None = None,
+        base_duration_sec: float = 3.0,
     ) -> bool:
         self.targets.append((command, degrees, speed_limit_deg_s))
         return True
@@ -131,9 +130,8 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge._mask_catch_up_targets = {}
         bridge._last_active_axis_mask = 0
         bridge._catch_up_axes_in_mask = True
-        bridge._intermediate_tolerance_failure_fatal = False
-        bridge._intermediate_goal_time_tolerance_sec = 0.5
         bridge._state = CommandState()
+        bridge._trajectory_duration_sec = 1.0
         bridge._trajectory_goal_response_timeout_sec = 5.0
         bridge._trajectory_result_timeout_margin_sec = 35.0
         bridge._goal_response_future = None
@@ -203,6 +201,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge._active_axis_mask_publisher = publisher
         bridge._catch_up_axes_in_mask = False
         scheduled = SimpleNamespace(
+            track_points=(),
             commands=(
                 SimpleNamespace(joint_name="boom"),
                 SimpleNamespace(joint_name="bucket"),
@@ -223,6 +222,7 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertTrue(state.apply_command("boom_angle", 100.0))
         scheduler = _Scheduler()
         bridge = ScratchHciBridge.__new__(ScratchHciBridge)
+        bridge._trajectory_duration_sec = 1.0
         bridge._state = state
         bridge._trajectory_scheduler = scheduler
         bridge.get_logger = lambda: _Logger()
@@ -251,7 +251,6 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge, scheduler, _logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         goal_handle = _GoalHandle(result_exception=RuntimeError("transport"))
         response_future = _Future(goal_handle)
@@ -267,30 +266,11 @@ class NodeCommandCallbackTest(unittest.TestCase):
         self.assertEqual(scheduler.completions, [])
         self.assertEqual(scheduler.send_failures, [])
 
-    def test_goal_tolerance_failure_preserves_queue_and_releases_gate(self) -> None:
-        bridge, scheduler, logger = self._bridge()
-        scheduled = SimpleNamespace(wait_stopped=False, execution_mode=SimpleNamespace(value="serial"))
-        future = _Future(SimpleNamespace(
-            status=6,
-            result=SimpleNamespace(error_code=-5, error_string="goal_time_tolerance"),
-        ))
-        bridge._active_goal_scheduled = scheduled
-        bridge._goal_result_future = future
-
-        bridge._goal_result_callback(future, scheduled)
-
-        self.assertEqual(scheduler.completions, [(scheduled, True)])
-        self.assertFalse(scheduler.preserve_queued)
-        self.assertIsNone(bridge._active_goal_scheduled)
-        self.assertIn("continuing queued", logger.warning_messages[-1])
-        self.assertIn("delta_deg=1.000", logger.warning_messages[-1])
-        self.assertEqual(logger.error_messages, [])
 
     def test_result_response_exception_cancels_without_releasing_gate(self) -> None:
         bridge, scheduler, _logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         goal_handle = _GoalHandle(result_future=_Future())
         result_future = _Future(exception=RuntimeError("transport"))
@@ -310,7 +290,6 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge, scheduler, _logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         goal_handle = _GoalHandle(result_future=_Future())
         bridge._active_goal_handle = goal_handle
@@ -328,7 +307,6 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge, scheduler, logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         response_future = _Future()
         bridge._goal_response_future = response_future
@@ -347,7 +325,6 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge, scheduler, _logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         goal_handle = _GoalHandle(
             result_future=_Future(),
@@ -371,7 +348,6 @@ class NodeCommandCallbackTest(unittest.TestCase):
         bridge, scheduler, _logger = self._bridge()
         scheduled = SimpleNamespace(
             target=SimpleNamespace(duration_sec=3.0),
-            execution_mode=SimpleNamespace(value="serial"),
         )
         result_future = _Future()
         goal_handle = _GoalHandle(result_future=result_future)

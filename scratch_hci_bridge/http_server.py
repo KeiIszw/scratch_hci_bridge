@@ -1,3 +1,4 @@
+"""ScratchのHTTP要求を受付順に適用し、停止と状態照会は即座に処理する。"""
 from __future__ import annotations
 
 import math
@@ -27,7 +28,7 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
 
     request_callback = None
     error_callback = None
-    queue_callback = None
+    joint_queue_callback = None
 
     def do_GET(self) -> None:
         request_callback = type(self).request_callback
@@ -51,6 +52,12 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         # Scratchから動作完了を確認する要求。ここでは新しい動作指令を登録しない。
         if query["type"] == ["reporter"]:
+            if query["cmd"] == ["joint_queue"]:
+                if query["val"] not in (["0"], ["1"], ["2"], ["3"]) or type(self).joint_queue_callback is None:
+                    self._send_text(400, "joint_queue val must be 0..3")
+                else:
+                    self._send_text(200, str(type(self).joint_queue_callback(int(query["val"][0]))))
+                return
             if query["val"] != ["0"]:
                 self._send_text(400, "reporter val must be 0")
                 return
@@ -61,8 +68,6 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_text(200, "ok")
             elif command == ["motion_error"] and type(self).error_callback is not None:
                 self._send_text(200, type(self).error_callback())
-            elif command == ["motion_queue"] and type(self).queue_callback is not None:
-                self._send_text(200, str(type(self).queue_callback()))
             elif command == ["motion_status"] and type(self).status_callback is not None:
                 self._send_text(200, {0: "idle", 1: "busy", -1: "failed", 2: "stopped"}.get(type(self).status_callback(), "failed"))
             else:
@@ -106,9 +111,6 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         ):
             self._send_text(400, "joint speed would exceed ROS Duration range")
             return
-        if command == "commit" and value not in (0, 1):
-            self._send_text(400, "commit val must be 0 or 1")
-            return
         # 通常指令は接続受付順に適用する。停止はこの待ち列を通さず即座に適用する。
         if command in ("stop", "reset"):
             self._apply(command, value)
@@ -130,7 +132,7 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
                 accepted = self.state.apply_command(command, value)
                 callback = type(self).command_callback
                 if accepted and callback is not None:
-                    callback(command, value)
+                    accepted = callback(command, value) is not False
         if accepted:
             self._send_text(200, "OK")
         else:
@@ -197,12 +199,12 @@ def create_http_server(
     error_callback: Callable[[], str] | None = None,
     request_callback: Callable[[bool], None] | None = None,
     state_lock=None,
-    queue_callback: Callable[[], int] | None = None,
+    joint_queue_callback: Callable[[int], int] | None = None,
 ) -> ScratchHTTPServer:
     class BoundScratchHTTPRequestHandler(ScratchHTTPRequestHandler):
         pass
 
-    BoundScratchHTTPRequestHandler.queue_callback = staticmethod(queue_callback)
+    BoundScratchHTTPRequestHandler.joint_queue_callback = staticmethod(joint_queue_callback)
     BoundScratchHTTPRequestHandler.error_callback = staticmethod(error_callback)
     BoundScratchHTTPRequestHandler.request_callback = staticmethod(request_callback)
     BoundScratchHTTPRequestHandler.state = state
