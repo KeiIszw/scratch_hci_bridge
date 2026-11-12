@@ -11,7 +11,7 @@ from decimal import Decimal
 from .command_state import (JOINT_LIMITS_DEG, ABSOLUTE_JOINT_COMMANDS,
     RELATIVE_JOINT_COMMANDS, is_safe_relative_swing_command, is_ros_duration_safe,
     is_safe_pid_speed_limit)
-from .track_timeline import TrackTimeline, TrackPoint
+from .track_timeline import TrackTimeline, TrackPoint, TrackSegment
 from .trajectory_targets import PID_JOINTS, PID_HTTP_TO_ROS, PID_ROS_TO_HTTP, TrajectoryTargetSnapshot
 
 _MIN_TRAJECTORY_DURATION_SEC = 0.001
@@ -40,11 +40,18 @@ class ScheduledTrajectory:
 class TrajectoryScheduler:
     """受付時に時刻を固定し、Action結果の遅れを後続区間へ積み重ねない。"""
 
-    def __init__(self, feedback_timeout_sec=0.5, max_dispatch_delay_sec=1.0):
+    def __init__(self, feedback_timeout_sec=0.5, max_dispatch_delay_sec=1.0, ground_timeout_sec=0.5):
         if not math.isfinite(feedback_timeout_sec) or feedback_timeout_sec < 0:
             raise ValueError('feedback_timeout_sec must be finite and non-negative')
         if not math.isfinite(max_dispatch_delay_sec) or max_dispatch_delay_sec <= 0:
             raise ValueError('max_dispatch_delay_sec must be finite and positive')
+        if not math.isfinite(ground_timeout_sec) or ground_timeout_sec <= 0:
+            raise ValueError('ground_timeout_sec must be positive and finite')
+        self._ground_timeout_sec = ground_timeout_sec
+        self._ground_value, self._ground_at = -1, float('-inf')
+        self._guard_status = 'reached'
+        self._guard_segment = None
+        self._guard_hold_revision = None
         self._lock = threading.RLock()
         self._feedback_timeout_sec = feedback_timeout_sec
         self._max_dispatch_delay_sec = max_dispatch_delay_sec
@@ -96,6 +103,9 @@ class TrajectoryScheduler:
             return False
         current = time.monotonic() if now is None else now
         with self._lock:
+            # ガードの後にboom区間を予約すると停止後に再下降するため受付を制限する。
+            if axis == 'boom' and self._guard_status == 'running':
+                return False
             index = [a for a, _ in PID_JOINTS].index(axis)
             if self.joint_queue(index, current):
                 return False
@@ -116,6 +126,75 @@ class TrajectoryScheduler:
                 self._ready_at = current
             self._stopped = False
             return True
+
+    def update_ground_contact(self, value, now=None):
+        """受信時刻も保持し、推定ノードの停止で古い非接地を使い続けない。"""
+        with self._lock:
+            self._ground_value = value if value in (-1, 0, 1) else -1
+            self._ground_at = time.monotonic() if now is None else now
+
+    def ground_contact(self, now=None):
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            return self._ground_value if 0 <= current-self._ground_at <= self._ground_timeout_sec else -1
+
+    def guard_status(self):
+        with self._lock:
+            return self._guard_status
+
+    def start_ground_guard(self, degrees, speed_limit_deg_s=None, base_duration_sec=3., now=None):
+        """unknown開始は拒否する。未確定の実測やcancel待ちからの下降も許可しない。"""
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            if self._guard_status == 'running':
+                return False
+            if (self.ground_contact(current) == -1 or self.stale_feedback(current)
+                    or self._interrupting or self._motion_failed):
+                self._guard_status = 'failed'
+                return False
+            if not self.update_http_target('boom_down', degrees, speed_limit_deg_s, base_duration_sec, current):
+                self._guard_status = 'failed'
+                return False
+            self._guard_segment = self._timeline.axes['boom'][-1]
+            self._guard_hold_revision = None
+            self._guard_status = 'running'
+            return True
+
+    def check_ground_guard(self, now=None):
+        """接地時はboomだけを実測位置へ置換する。異常時は呼出し側の既存安全停止を使う。"""
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            if self._guard_status != 'running':
+                return None
+            contact = self.ground_contact(current)
+            if contact == -1 or self._motion_failed or self.stale_feedback(current):
+                self._guard_status = 'failed'
+                return 'ground_unknown'
+            # barrier待ちの他軸を巻き込まない。既に接地なら区間開始時に保持する。
+            if current < self._guard_segment.start or contact == 0:
+                return None
+            measured = self._feedback_positions_rad['boom']
+            self._timeline.axes['boom'] = [TrackSegment(current, current+.001, measured, measured)]
+            self._timeline.revision += 1
+            self._timeline.barrier_time = max([current] + [s.end for ss in self._timeline.axes.values() for s in ss])
+            self._revision += 1
+            self._commands = [c for c in self._commands if c.joint_name != 'boom']
+            self._commands.append(QueuedMotionCommand('boom_angle', 'boom', math.degrees(measured), self._revision))
+            self._commanded_targets_rad['boom'] = measured
+            self._guard_hold_revision = self._revision
+            self._guard_status = 'contact'
+            self._guard_segment = None
+            return None
+
+    def is_guard_hold(self, scheduled):
+        with self._lock:
+            return self._guard_hold_revision is not None and scheduled.target.revision == self._guard_hold_revision
+
+    def guard_blocks_old_boom(self, scheduled):
+        """保持goalの受理待ち中、旧goalへの追従許可で再下降しないようにする。"""
+        with self._lock:
+            return (self._guard_hold_revision is not None and
+                    (scheduled is None or scheduled.target.revision < self._guard_hold_revision))
 
     def _append(self, timeline, command, duration, now):
         axis = command.joint_name
@@ -211,6 +290,9 @@ class TrajectoryScheduler:
             if not successful:
                 self.stop(reason)
             elif scheduled.target.revision == self._revision:
+                if self._guard_status == 'running':
+                    self._guard_status = 'reached'
+                    self._guard_segment = None
                 self._timeline = None
                 self._commands.clear()
                 self._ready_at = None
@@ -274,6 +356,12 @@ class TrajectoryScheduler:
             if not reset and reason != 'stopped' and self._last_error in ('', 'stopped'):
                 self._failure_details = self.goal_diagnostics()
                 self._last_error = reason
+            if self._guard_status == 'running' or (reason != 'stopped' and not reset):
+                self._guard_status = 'failed'
+            if reset:
+                self._guard_status = 'reached'
+            self._guard_segment = None
+            self._guard_hold_revision = None
             self._timeline = None
             self._pending.clear()
             self._commands.clear()

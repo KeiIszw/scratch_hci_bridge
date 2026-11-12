@@ -19,7 +19,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64, UInt8
+from std_msgs.msg import Float64, UInt8, Int8
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from scratch_hci_bridge.command_state import (
@@ -281,11 +281,20 @@ class ScratchHciBridge(Node):
             for http_name, _ in PID_JOINTS
             if self._unity_position_output_enabled
         }
+        ground_timeout = self.declare_parameter('ground_timeout_sec', 0.5).value
+        ground_prefix = self.declare_parameter('ground_topic_prefix', '/TB20e_0/ground').value.rstrip('/')
+        self._ground_clearance, self._ground_clearance_at = float('nan'), float('-inf')
+        self._ground_timeout_sec = ground_timeout
         self._trajectory_scheduler = TrajectoryScheduler(
+            ground_timeout_sec=ground_timeout,
             feedback_timeout_sec=self._joint_state_timeout_sec,
             **{name: float(self.get_parameter(name).value) for name in
                ("max_dispatch_delay_sec",)},
         )
+        self._ground_contact_subscription = self.create_subscription(
+            Int8, ground_prefix+'/contact', self._ground_contact_callback, 10)
+        self._ground_clearance_subscription = self.create_subscription(
+            Float64, ground_prefix+'/clearance', self._ground_clearance_callback, 10)
         self._trajectory_client = ActionClient(
             self, FollowJointTrajectory, trajectory_action
         )
@@ -321,6 +330,7 @@ class ScratchHciBridge(Node):
             self._http_activity,
             self._motion_lock,
             joint_queue_callback=self._trajectory_scheduler.joint_queue,
+            ground_reporter_callback=self._ground_reporter,
         )
         self._http_thread = threading.Thread(
             target=self._http_server.serve_forever,
@@ -359,6 +369,14 @@ class ScratchHciBridge(Node):
                 return
             if command in ("left_crawler_speed", "right_crawler_speed"):
                 self._trajectory_scheduler.accept_motion()
+            if command == 'boom_down_until_contact':
+                snapshot = self._state.snapshot()
+                accepted = self._trajectory_scheduler.start_ground_guard(value,
+                    snapshot.joint_speed_limits_deg_s['boom'], self._trajectory_duration_sec)
+                if not accepted:
+                    # HTTP拡張が400を無視しても、guard_statusとmotion_statusから異常を検出する。
+                    self._stop_motion('ground_guard_rejected')
+                return accepted
             relative_command = RELATIVE_JOINT_COMMANDS.get(command)
             absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
             if absolute_joint in DIRECT_JOINT_NAMES:
@@ -385,6 +403,29 @@ class ScratchHciBridge(Node):
         finally:
             # HTTP受付中に検知した失敗も最初の原因をログへ残す。
             self._log_new_motion_failure(previous_error)
+
+    @_motion_serialized
+    def _ground_contact_callback(self, message):
+        self._trajectory_scheduler.update_ground_contact(message.data)
+        reason = self._trajectory_scheduler.check_ground_guard()
+        if reason:
+            self._stop_motion(reason)
+        else:
+            self._refresh_active_axis_mask()
+
+    @_motion_serialized
+    def _ground_clearance_callback(self, message):
+        self._ground_clearance, self._ground_clearance_at = message.data, time.monotonic()
+
+    @_motion_serialized
+    def _ground_reporter(self, command):
+        if command == 'guard_status':
+            return self._trajectory_scheduler.guard_status()
+        if command == 'ground_contact':
+            return {-1: 'unknown', 0: '0', 1: '1'}[self._trajectory_scheduler.ground_contact()]
+        now = time.monotonic()
+        value = self._ground_clearance
+        return f'{value:.3f}' if math.isfinite(value) and 0 <= now-self._ground_clearance_at <= self._ground_timeout_sec else 'unknown'
 
     def _joint_state_callback(self, message: JointState) -> None:
         self._trajectory_scheduler.update_from_joint_state(
@@ -425,6 +466,9 @@ class ScratchHciBridge(Node):
             self._stop_motion("stale")
         previous_error = self._trajectory_scheduler.motion_error()
         self._trajectory_scheduler.check_deadlines(now)
+        reason = self._trajectory_scheduler.check_ground_guard(now)
+        if reason:
+            self._stop_motion(reason)
         self._log_new_motion_failure(previous_error)
         if self._trajectory_scheduler.needs_cancel() and not self._stop_pending:
             self._stop_motion(self._trajectory_scheduler.motion_error())
@@ -619,6 +663,11 @@ class ScratchHciBridge(Node):
 
     def _write_active_axis_mask(self, *, only_if_changed: bool = False) -> None:
         active_joints = self._mask_commanded_axes | self._mask_catch_up_targets.keys()
+        scheduler = getattr(self, '_trajectory_scheduler', None)
+        blocks_old_boom = getattr(scheduler, 'guard_blocks_old_boom', None)
+        if blocks_old_boom and blocks_old_boom(getattr(self, '_active_goal_scheduled', None)):
+            # 接地後にAction応答が遅れても、旧目標への追従出力で下降を続けない。
+            active_joints.discard('boom')
         mask = 0
         for bit, (http_name, _) in enumerate(PID_JOINTS):
             if http_name in active_joints:
@@ -700,6 +749,10 @@ class ScratchHciBridge(Node):
         if replacing is not None and self._trajectory_scheduler.needs_cancel():
             self._stop_motion(self._trajectory_scheduler.motion_error())
         if not getattr(self, "_stop_pending", False):
+            is_guard_hold = getattr(self._trajectory_scheduler, 'is_guard_hold', None)
+            if is_guard_hold and is_guard_hold(scheduled):
+                # 受理前のドリフトも保持位置へ戻せるよう、新goalの実測差で許可を再評価する。
+                self._publish_active_axis_mask(scheduled)
             self._publish_unity_position_target(scheduled)
         if submission_started_at is None:
             submission_started_at = time.monotonic()

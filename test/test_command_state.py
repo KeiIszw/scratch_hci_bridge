@@ -157,7 +157,7 @@ class CommandStateTest(unittest.TestCase):
             "left_crawler_speed",
             "right_crawler_speed",
         }
-        expected_commands.update(("stop", "reset", "barrier"))
+        expected_commands.update(("stop", "reset", "barrier", "boom_down_until_contact"))
         self.assertEqual(SUPPORTED_COMMANDS, expected_commands)
 
         joint_commands = {

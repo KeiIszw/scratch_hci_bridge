@@ -29,6 +29,7 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
     request_callback = None
     error_callback = None
     joint_queue_callback = None
+    ground_reporter_callback = None
 
     def do_GET(self) -> None:
         request_callback = type(self).request_callback
@@ -62,7 +63,9 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_text(400, "reporter val must be 0")
                 return
             command = query["cmd"]
-            if command == ["heartbeat"]:
+            if len(command) == 1 and command[0] in ('ground_clearance', 'ground_contact', 'guard_status') and type(self).ground_reporter_callback is not None:
+                self._send_text(200, type(self).ground_reporter_callback(command[0]))
+            elif command == ["heartbeat"]:
                 if request_callback is not None:
                     request_callback(True)
                 self._send_text(200, "ok")
@@ -200,10 +203,12 @@ def create_http_server(
     request_callback: Callable[[bool], None] | None = None,
     state_lock=None,
     joint_queue_callback: Callable[[int], int] | None = None,
+    ground_reporter_callback: Callable[[str], str] | None = None,
 ) -> ScratchHTTPServer:
     class BoundScratchHTTPRequestHandler(ScratchHTTPRequestHandler):
         pass
 
+    BoundScratchHTTPRequestHandler.ground_reporter_callback = staticmethod(ground_reporter_callback)
     BoundScratchHTTPRequestHandler.joint_queue_callback = staticmethod(joint_queue_callback)
     BoundScratchHTTPRequestHandler.error_callback = staticmethod(error_callback)
     BoundScratchHTTPRequestHandler.request_callback = staticmethod(request_callback)
