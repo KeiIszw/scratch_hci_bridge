@@ -144,13 +144,13 @@ PYTHONPATH=src/scratch_hci_bridge /usr/bin/python3 -m pytest src/scratch_hci_bri
 `tb20e_ground_sensing` と同時に使用する。`ground_topic_prefix`（既定 `/TB20e_0/ground`）の
 `clearance`（std_msgs/Float64、m、NaN=unknown）、`contact`（std_msgs/Int8、-1=unknown、0/1）
 を購読する。`ground_timeout_sec`（既定0.5秒）を過ぎた値はunknownとして扱う。
-launchでも両パラメータを指定できる。
+launchでもこれらのパラメータを指定できる。
 
 | reporter（val=0） | 本文 |
 |---|---|
 | ground_clearance | m、小数3桁。非有限値・受信途絶は `unknown` |
 | ground_contact | `1` / `0` / `unknown` |
-| guard_status | `running` / `contact` / `reached` / `failed` |
+| guard_status | `running` / `contact` / `stalled` / `reached` / `blocked` / `failed` |
 
 `boom_down_until_contact`（val=最大下げ角度[deg]、符号無視）は、boom_downと同じ速度・可動域・
 FIFO・barrierで区間を予約する。新鮮な接地情報と4軸feedbackが揃わない開始は400で拒否し、
@@ -160,15 +160,57 @@ FIFO・barrierで区間を予約する。新鮮な接地情報と4軸feedbackが
 ガード実行中は追加のboom指令を拒否する。直接HTTPで拒否するとguardは継続するが、
 Scratchのガード二重起動など、ガード開始要求の拒否は安全停止する。
 区間がbarrierで未来に予約された場合は、開始時刻から接地による保持を適用する。
-接地した時点の実測boom位置・速度0へgoalを置換し、boomの残りの区間を捨てる。
-他軸の計画は維持する。センサーcallbackで保持を予約し、publish_hzとAction受理ゲートで送信する。
-軸マスク有効時は接地直後から保持goal受理までboomを禁止し、旧goalへの追従を抑える。
-保持goalの受理時に実測差から保持出力を再評価する。マスクなしではgoal置換の受理まで旧goalが動き得る。
-実際の停止距離・追従遅れをゼロにはできないので、Unityで動作速度ごとに確認する。
+実行区間で新鮮な`ground_clearance`が`ground_slow_distance_m=0.2`m未満になったら、
+残りのboom下降を`ground_slow_speed_deg_s=1.0`°/s以下へ一度だけ減速する。両値はlaunchでも設定可能。
+計画現在位置と実測のうち下降側に進んだ方を新しい起点にし、上方向へ戻さない。
+実測が終点を越えていれば実測位置で止める。距離が増えても再加速しない。既に十分遅い区間は変更しない。
+実測へ起点を変更した場合は始端速度0でつなぎ、上向きの位置・速度を生成しない。
+JTCの3次補間で最大速度が平均の1.5倍になるため、残所要時間は1.5×残角度÷上限速度とする。
+減速で延びた時間（負なら0）だけ、旧終点以降に始まる未来区間と保存barrierを後ろへ送る。
+開始済みの他軸は継続し、barrier後の区間が下降完了前に先行することを防ぐ。
+減速後の追加指令にも更新済みのbarrierを使う。新鮮な距離が未受信なら減速は行わず、
+接地のunknown/途絶による既存停止を引き続き使う。
 
-`contact` は保持計画への変更時、`reached` は最新Actionの正常終端時に返す。
-`contact` は物理的な停止完了を意味しない。必要なら既存の「止まるまで待つ」で終端も待つ。
-複数軸をHTTPから後続追加した場合、reachedはその最新goalの終端まで待つ。
-unknown通知・接地情報途絶・feedback異常で `failed` とし、計画破棄・走行ゼロ・cancelを行う。
-stopは実行中ガードをfailed、resetはガードをreached（実行なし）へ戻す。
-リース、Action拒否・失敗・timeout、cancel終端ゲートは既存の停止経路を共有する。
+終了理由は次の状態で区別する。`guard_status`は保持の予約時点で変わり、停止完了は
+`motion_status=idle`で確認する。正常な打切りではresetなしで次の指令を受け付ける。
+
+| 状態 | 意味 | motion failedラッチ |
+|---|---|---|
+| running | barrier待ち、または下降中 | なし |
+| contact | 推定接地（ground_sensingで連続観測・急落除去済み） | なし |
+| stalled | 新鮮な距離の直近5観測中央値が0.2m未満でboomが停滞。接地扱いで保持 | なし |
+| reached | 指定角度へ到達し、推定接地なし。実測位置で保持 | なし |
+| blocked | 距離中央値が0.2m以上で停滞。障害物の可能性として保持 | なし |
+| failed | センサーunknown/途絶、角度途絶、Action拒否などの異常 | あり、reset必須 |
+
+停滞は`ground_stall_sec=0.5`秒以上の実測boom角の全振幅が
+`ground_stall_epsilon_deg=0.1`°以下の場合。繰り返し読むtimerは観測に数えない。
+JTC相当の3次補間位置が実測より下降側へ0.1°を超えて進んでいる観測だけを数える。
+計画が実測の後ろにある間は窓を毎回リセットし、追いつき待ちの時間を停滞へ加算しない。
+減速置換時にも旧窓を捨てる。窓内の予定変位>0.2°（0.5秒で平均>0.4°/s）も必要とし、
+3次補間の始動待ちを除外する。計画終了後は未到達量>0.1°の停止を検出する。
+静止幅0.1°/0.5秒は正味の平均速度0.2°/s以下に相当するが、往復も検出するため全振幅で判定する。
+2026-11-12の3試行の保持後実測振幅と受信周期は`codex_runs/20261112_guard_fix2/report.md`を参照する。
+距離は刃先だけでなく有効バケットコライダーの形状最小であり、背面が先に当たる姿勢も分類へ反映する。
+近い/遠いの分類には新鮮な有限距離を必須とし、不明ならfailedとする。
+両停滞パラメータはlaunchでも設定可能。地面近くの物理障害物もstalledになるため、
+真の接地を保証する状態ではない。必要に応じ「接地動作状態」で分岐する。
+
+接地・停滞・到達でboomの残りの区間を捨て、実測角・速度0の保持goalへ置換する。
+他軸の計画は維持する。検知後にさらに下がった角度へ保持goalを追従させ、0.5秒の
+静止確認後に固定する（下降はboom角の正方向）。検知位置へ上向きに戻す目標は作らない。
+静止確認中の追加boomは拒否するので、HTTPはidleを待ってから送る。
+Scratchの接地ブロックは終了理由を変数「接地動作状態」に保存し、保持Actionと静止確認の
+完了も待ってから次へ進む。正常4状態では「特殊：停止」を呼ばない。
+
+軸マスク有効時は検知直後・古い保持goal受理待ち・実測が旧保持角を越えた時点でboomを禁止する。
+JointState callbackでも即時に再評価し、古い角への上向き追従を再許可しない。
+Unity位置出力にも遅着した古い保持角を流さない。マスクなしのJTCへ既に送ったgoalは
+後から書き換えられず、通信/受理中の追従を完全には抑止できない。実際の停止距離はUnityで確認する。
+
+JTCの許容超過は、新鮮な実測停滞から保持へ移行でき、他の指令軸が0.75°以内に到達済みの場合、
+またはその保持より古いgoalの結果の場合だけ回復する。それ以外の失敗を隠さない。
+最終保持goalそのものの失敗、unknown・feedback異常、リース切れ、Action拒否・timeoutは
+計画破棄・走行ゼロ・cancelを行いfailedをラッチする。停止根拠や制御の成立が不明なため、
+Scratchも停止してreset後の再確認を求める。stopは実行中ガードをfailed、resetはreachedへ戻す。
+stop/reset/failedで古い終点・保持目標を破棄し、cancel終端までは既存の送信ゲートを維持する。

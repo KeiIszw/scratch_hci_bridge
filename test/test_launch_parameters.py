@@ -42,3 +42,24 @@ def test_catch_up_axes_launch_parameter(override, expected):
         node = next(action for action in description.entities if isinstance(action, Node))
         parameters = evaluate_parameters(context, node._Node__parameters)[0]
     assert parameters['catch_up_axes_in_mask'] is expected
+
+
+def test_ground_slow_launch_parameters_are_typed_and_overridable():
+    """launchからの文字列が浮動小数の減速パラメータとしてノードへ届くことを確認する。"""
+    root = Path(__file__).parents[1]
+    spec = importlib.util.spec_from_file_location('bridge_launch', root/'launch/scratch_hci_bridge.launch.py')
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    with patch('launch.logging.get_logger', return_value=logging.getLogger(__name__)):
+        context = LaunchContext()
+        context.launch_configurations.update(ground_slow_distance_m='0.15',ground_slow_speed_deg_s='1.5',
+            ground_stall_sec='0.7',ground_stall_epsilon_deg='0.08')
+        description = module.generate_launch_description()
+        for action in description.entities:
+            if isinstance(action, DeclareLaunchArgument): action.execute(context)
+        node = next(action for action in description.entities if isinstance(action, Node))
+        parameters = evaluate_parameters(context,node._Node__parameters)[0]
+    assert parameters['ground_slow_distance_m']==.15
+    assert parameters['ground_slow_speed_deg_s']==1.5
+
+    assert parameters['ground_stall_sec']==.7
+    assert parameters['ground_stall_epsilon_deg']==.08

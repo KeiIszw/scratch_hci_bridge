@@ -10,7 +10,9 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
-                ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0), ("ground_timeout_sec", 0.5))],
+                ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0), ("ground_timeout_sec", 0.5),
+                ("ground_slow_distance_m", 0.2), ("ground_slow_speed_deg_s", 1.0),
+                ("ground_stall_sec", 0.5), ("ground_stall_epsilon_deg", 0.1))],
             DeclareLaunchArgument("ground_topic_prefix", default_value="/TB20e_0/ground"),
             DeclareLaunchArgument("excavator", default_value="tb20e"),
             DeclareLaunchArgument("publish_hz", default_value="50.0"),
@@ -67,7 +69,9 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
-                           for name in ("client_lease_sec", "max_dispatch_delay_sec", "ground_timeout_sec")},
+                           for name in ("client_lease_sec", "max_dispatch_delay_sec", "ground_timeout_sec",
+                                        "ground_slow_distance_m", "ground_slow_speed_deg_s",
+                                        "ground_stall_sec", "ground_stall_epsilon_deg")},
                         "ground_topic_prefix": LaunchConfiguration("ground_topic_prefix"),
                         "excavator": LaunchConfiguration("excavator"),
                         "publish_hz": ParameterValue(

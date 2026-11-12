@@ -75,7 +75,8 @@ def test_reached_only_on_latest_successful_terminal_result():
     s.check_ground_guard(2.1)
     assert s.guard_status() == 'running'
     s.mark_completed(goal, successful=True, now=2.1)
-    assert s.guard_status() == 'reached' and s.motion_status() == 0
+    assert s.guard_status() == 'reached' and s.motion_status() == 1
+    assert s._guard_hold_position == s._feedback_positions_rad['boom']
 
 
 @pytest.mark.parametrize('value,now', [(-1, .1), (99, .1), (0, .501)])
@@ -116,7 +117,11 @@ def test_node_contact_during_acceptance_and_replacement():
     h.accept(1, now=.12)
     assert h.sent[1][0].trajectory.points[-1].positions[1] == pytest.approx(math.radians(-49))
     h.result(1, now=.2)
-    assert s.guard_status() == 'contact' and s.motion_status() == 0
+    assert s.guard_status() == 'contact' and s.motion_status() == 1
+    s.update_from_joint_state(NAMES, [0, math.radians(-49), 2, 1], now=.7)
+    s.update_ground_contact(1, now=.7)
+    h.tick(.7); h.accept(2, now=.7); h.result(2, now=.71)
+    assert s.motion_status() == 0
 
 
 def test_node_unknown_cancels_and_keeps_gate_until_result():
@@ -169,8 +174,8 @@ def test_contact_masks_old_boom_during_hold_goal_response_delay():
     assert mask(h) == 0
     h.tick(.1)
     assert len(h.sent) == 2 and mask(h) == 0
-    # 新しい保持目標を受理した後だけ、その保持位置への追従を許可できる。
+    # 受理前の行き過ぎを戻す古い保持目標は、受理後も許可しない。
     h.scheduler.update_from_joint_state(NAMES, [0, math.radians(-48), 2, 1], now=.2)
     h.accept(1, now=.2)
-    assert mask(h) == 2
+    assert mask(h) == 0
     assert h.sent[1][0].trajectory.points[-1].positions[1] == pytest.approx(math.radians(-50))

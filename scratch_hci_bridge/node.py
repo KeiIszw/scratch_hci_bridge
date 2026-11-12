@@ -287,6 +287,10 @@ class ScratchHciBridge(Node):
         self._ground_timeout_sec = ground_timeout
         self._trajectory_scheduler = TrajectoryScheduler(
             ground_timeout_sec=ground_timeout,
+            ground_slow_distance_m=self.declare_parameter('ground_slow_distance_m', 0.2).value,
+            ground_slow_speed_deg_s=self.declare_parameter('ground_slow_speed_deg_s', 1.0).value,
+            ground_stall_sec=self.declare_parameter('ground_stall_sec', 0.5).value,
+            ground_stall_epsilon_deg=self.declare_parameter('ground_stall_epsilon_deg', 0.1).value,
             feedback_timeout_sec=self._joint_state_timeout_sec,
             **{name: float(self.get_parameter(name).value) for name in
                ("max_dispatch_delay_sec",)},
@@ -416,6 +420,7 @@ class ScratchHciBridge(Node):
     @_motion_serialized
     def _ground_clearance_callback(self, message):
         self._ground_clearance, self._ground_clearance_at = message.data, time.monotonic()
+        self._trajectory_scheduler.update_ground_clearance(message.data, self._ground_clearance_at)
 
     @_motion_serialized
     def _ground_reporter(self, command):
@@ -427,10 +432,12 @@ class ScratchHciBridge(Node):
         value = self._ground_clearance
         return f'{value:.3f}' if math.isfinite(value) and 0 <= now-self._ground_clearance_at <= self._ground_timeout_sec else 'unknown'
 
+    @_motion_serialized
     def _joint_state_callback(self, message: JointState) -> None:
         self._trajectory_scheduler.update_from_joint_state(
             message.name, message.position
         )
+        self._refresh_active_axis_mask()
 
     @_motion_serialized
     def _http_activity(self, heartbeat: bool) -> None:
@@ -618,6 +625,10 @@ class ScratchHciBridge(Node):
                 )
                 return
         for http_name, ros_name in PID_JOINTS:
+            if (http_name == 'boom' and getattr(self, '_trajectory_scheduler', None) is not None
+                    and self._trajectory_scheduler.guard_blocks_old_boom(scheduled)):
+                # 応答待ち中に実測が下がった場合、位置出力側にも古い保持角を流さない。
+                continue
             message = Float64()
             message.data = (
                 self._unity_position_signs[http_name]
@@ -751,7 +762,7 @@ class ScratchHciBridge(Node):
         if not getattr(self, "_stop_pending", False):
             is_guard_hold = getattr(self._trajectory_scheduler, 'is_guard_hold', None)
             if is_guard_hold and is_guard_hold(scheduled):
-                # 受理前のドリフトも保持位置へ戻せるよう、新goalの実測差で許可を再評価する。
+                # 受理前に下がった実測を優先し、古い保持位置への上昇をマスクで抑える。
                 self._publish_active_axis_mask(scheduled)
             self._publish_unity_position_target(scheduled)
         if submission_started_at is None:
@@ -822,11 +833,15 @@ class ScratchHciBridge(Node):
         self._trajectory_scheduler.mark_completed(
             scheduled, successful=successful, reason=reason
         )
-        if successful:
+        recovered_guard = not successful and self._trajectory_scheduler.motion_status() != -1
+        if successful or recovered_guard:
             self._mask_commanded_axes.clear()
             self._refresh_active_axis_mask()
         else:
             self._publish_active_axis_mask()
+        if recovered_guard:
+            self.get_logger().info('Guard retained measured hold after superseded tolerance result')
+            return
         if successful:
             self.get_logger().info(
                 f"Completed joint timeline goal"
