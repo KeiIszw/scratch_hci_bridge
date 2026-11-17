@@ -30,6 +30,7 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
     error_callback = None
     joint_queue_callback = None
     ground_reporter_callback = None
+    sensor_reporter_callback = None
 
     def do_GET(self) -> None:
         request_callback = type(self).request_callback
@@ -45,6 +46,8 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         if "type" not in query:
             self._send_text(400, "type=command is required")
             return
+        if query.get("type") == ["command"] and query.get("cmd") == ["barrier"] and "val" not in query:
+            query["val"] = ["0"]
         if "cmd" not in query or "val" not in query:
             self._send_text(400, "cmd and val are required")
             return
@@ -53,6 +56,16 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         # Scratchから動作完了を確認する要求。ここでは新しい動作指令を登録しない。
         if query["type"] == ["reporter"]:
+            if (len(query['cmd']) == 1 and query['cmd'][0] in
+                    ('joint_angle', 'stall_joints', 'stall_position', 'motion_outcome')):
+                command = query['cmd'][0]
+                allowed = ('0', '1', '2', '3') if command in ('joint_angle', 'stall_position') else ('0',)
+                callback = type(self).sensor_reporter_callback
+                if len(query['val']) != 1 or query['val'][0] not in allowed or callback is None:
+                    self._send_text(400, 'invalid sensor reporter val')
+                else:
+                    self._send_text(200, callback(command, int(query['val'][0])))
+                return
             if query["cmd"] == ["joint_queue"]:
                 if query["val"] not in (["0"], ["1"], ["2"], ["3"]) or type(self).joint_queue_callback is None:
                     self._send_text(400, "joint_queue val must be 0..3")
@@ -132,6 +145,11 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.server.command_epoch += 1
             expired = command not in ("stop", "reset") and self.request_epoch != self.server.command_epoch
             if not expired:
+                status = type(self).status_callback
+                if command not in ('stop', 'reset') and status is not None and status() == -1:
+                    # failed中の走行・直結関節も状態更新前に拒否し、resetまで再始動させない。
+                    self._send_text(400, 'motion failed; reset required')
+                    return
                 accepted = self.state.apply_command(command, value)
                 callback = type(self).command_callback
                 if accepted and callback is not None:
@@ -204,10 +222,12 @@ def create_http_server(
     state_lock=None,
     joint_queue_callback: Callable[[int], int] | None = None,
     ground_reporter_callback: Callable[[str], str] | None = None,
+    sensor_reporter_callback: Callable[[str, int], str] | None = None,
 ) -> ScratchHTTPServer:
     class BoundScratchHTTPRequestHandler(ScratchHTTPRequestHandler):
         pass
 
+    BoundScratchHTTPRequestHandler.sensor_reporter_callback = staticmethod(sensor_reporter_callback)
     BoundScratchHTTPRequestHandler.ground_reporter_callback = staticmethod(ground_reporter_callback)
     BoundScratchHTTPRequestHandler.joint_queue_callback = staticmethod(joint_queue_callback)
     BoundScratchHTTPRequestHandler.error_callback = staticmethod(error_callback)

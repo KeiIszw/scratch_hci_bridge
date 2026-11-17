@@ -32,7 +32,7 @@ HTTPは到着順に処理し、stop/resetは待機列を追い越して適用し
 | bucket_dump / bucket_scoop | 移動量[deg]。負方向 / 正方向 |
 | swing_angle / boom_angle / arm_angle / bucket_angle | 絶対目標[deg]への区間を追加 |
 | swing_speed / boom_speed / arm_speed / bucket_speed | 後から受け付ける区間の速度[deg/s]。0で未設定へ戻す |
-| barrier | val未使用。全関節の受付済み区間の最大終了時刻を保存 |
+| barrier | 0・省略: 計画終了の区切り。1: 計画終了と実測到着を待つゲート。その他は拒否 |
 | blade_angle / body_angle / thumb_angle | 個別topicへ直接送る目標[deg] |
 | left_crawler_speed / right_crawler_speed | 左右走行速度 |
 | stop | val未使用。走行ゼロ、計画破棄、goalをcancel |
@@ -45,7 +45,8 @@ HTTPは到着順に処理し、stop/resetは待機列を追い越して適用し
 bodyはクランプしません。
 
 区間の起点は同関節の直前の区間の目標です。区間がなければ直前の指令目標を使い、
-未指令の関節・stop/reset・致命的失敗の後は実測を使います。
+未指令の関節・stop/resetの後は実測を使います。抵抗停止後は固定した停止位置を使います。
+stopは次の動作指令で自動解除し、異常failedはresetが必要です。
 所要時間は受付時の速度があれば「クランプ後の移動量÷速度」、未設定なら
 `trajectory_duration_sec`。最短時間は0.001秒です。受付後の速度変更は既存区間へ影響しません。
 feedback未受信中の指令は速度と順序を保持し、feedbackが揃った時点で角度と時刻を解決します。
@@ -54,7 +55,7 @@ ROS Durationで表現できない時間は拒否します。
 ## barrierと先行送信
 
 区間の開始は `max(受付時刻, 保存した区切り時刻, 同関節の直前終了)` です。
-barrierは計画時刻を保存するだけで、停止結果を待ちません。
+`barrier val=0`（val省略も同じ）は計画時刻を保存するだけで、停止結果を待ちません。
 短い関節は自分の目標を保持し、区切りまで待ちます。
 
 ```text
@@ -73,9 +74,40 @@ barrierを挟んでも同じ時刻に接続すれば止まりません。
 置換始点は計画上の現在位置です。全関節の境界の和集合を軌道点に使います。
 送信はpublish_hzのタイマーとgoal受理応答のゲートを通るため、同周期内の追加は一つにまとまります。
 
-Scratchの「動作モード：シリアル／パラレル」は変数変更とbarrier送信です。
-動作ブロックは対応するjoint_queueが0になるまで安全確認付きで待ち、serialなら追加のbarrierを送り、
-動作を送って次へ進みます。「止まるまで待つ」だけが実際の停止結果を待ちます。
+`barrier val=1`は、それまでの全区間が計画終了し、指令済み各関節の実測が最終目標から
+軸別の位置許容以内、かつ実測角速度が`serial_arrival_speed_deg_s=2.0`°/s未満になるまで、
+後から受け付ける区間を保留します。既定の位置許容はswing 1.5°、boom 2.5°、arm/bucket 5.5°。
+boomは記録の静止残差約1.95°を受け入れる余裕を取っています。
+指令済み全軸を判定し、未指令軸の到着目標は作りません。
+角速度はフィードバック位置の隣接差分の絶対値を0.1秒窓（境界直前の1サンプルを含む）で積算し、経過秒で割ります。
+旋回の±360°のwrapを除き、反転が相殺されない形で平滑化します。
+初回や0.2秒超の途絶・時計逆行の後は、0.1秒以上の連続観測が揃うまで通しません。
+判定はタイマー周期（既定20ms）で行い、解除時の現在時刻から後続を開始します。
+2°/s未満なので厳密な完全静止を保証する条件ではありません。一度通したゲートは閉じ直しません。
+通常到着で通過した軸は、次の明示指令まで実測位置を保持出力に使い、出力マスクによる再許可も抑止します。
+通常到着した軸の次の相対指令の**終点**は従来の理想目標から計算し、**始点と所要時間**を受け入れた実測位置に合わせます。
+抵抗で停止した軸は未達目標を捨て、固定した停止位置を能動保持し、次の同軸指令の始点・相対終点の基準にも使います。
+これにより他軸追加時の保持補正を抑え、往復指令の残留誤差を累積させません。
+保留中は速度と受付順を保持し、Actionの軌道・出力許可の対象に含めず、joint_queueには数えます。
+複数ゲート、従来barrier、feedback待ちの受付も順序を保ちます。後続のval=0で未解除ゲートを解除しません。
+
+到着待ちの期限は「計画終了とゲート適用時刻の遅い方」から`serial_arrival_timeout_sec=10.0`秒です。
+計画時間そのものはこの到着待ち期限へ含めません。抵抗停止を確定した軸は実測保持へ置換し、
+到着済みとして扱います。下記の抵抗条件を満たさない許容外静止は自動続行せず、10秒で異常終了します。
+別に`motion_timeout_sec=240.0`秒の全体期限があり、最初の指令受付からidleまでを計測します。
+計画・接地減速・ゲート待ち・抵抗保持・結果待ちを含み、追加指令や保持置換では延長しません。
+超過時は後続へ進めず、`motion_status=failed` / `motion_error=serial_arrival_timeout`をラッチし、
+保留・計画を破棄、走行ゼロ・出力マスク0・goal cancelへ進みます。resetでラッチを解除してください。
+feedback途絶、Action失敗、stop/resetも保留とゲートを破棄し、送信済みgoalの終端待ちは維持します。
+前半だけのAction成功では保留を捨てず、到着待ち中に同じ保持goalを繰り返し送りません。
+接地ガードの待機中は下降を開始せず、実行中の減速で延びた計画終了も待ちます。
+contact/stalled/reached/blockedで正常打切りした場合は、元の下降目標を捨てた後の実測保持目標で判定します。
+
+Scratchの「動作モード：シリアル」は変数変更とbarrier val=1送信、パラレルはval=0送信です。
+相対動作・角度ブロックは対応するjoint_queueが0になるまで安全確認付きで待ち、serialなら
+barrier val=1を送り、動作を送って次へ進みます。接地動作もserialではval=1、parallelではval=0で区切ります。
+「特殊：姿勢初期化」は呼出し元の実行モードを退避し、並列で初期姿勢へ移動して停止完了を待ち、
+元のモードへ戻します。「止まるまで待つ」は最後のAction成功とブリッジの軸別位置・実測速度条件の両方を待ちます。
 
 ## reporterと安全停止
 
@@ -84,20 +116,67 @@ Scratchの「動作モード：シリアル／パラレル」は変数変更とb
 | 名前 | val | 本文 |
 |---|---|---|
 | joint_queue | 0 / 1 / 2 / 3 | swing / boom / arm / bucketの未開始区間数。整数文字列 |
-| motion_status | 0 | idle / busy / failed / stopped |
-| motion_error | 0 | 最初の失敗理由。resetまで保持 |
+| motion_status | 0 | idle / busy / stopped / failed。stopは次の動作指令で自動解除 |
+| motion_error | 0 | 最初の失敗理由はresetまで保持。通常stopのstoppedは次の動作指令で消去 |
 | heartbeat | 0 | ok。リース監視を有効化・更新 |
+| joint_angle | 0 / 1 / 2 / 3 | swing / boom / arm / bucketの実測[deg]、小数3桁。欠測・非有限・期限切れはunknown |
+| stall_joints | 0 | 抵抗停止した関節名をswing,boom,arm,bucket順のカンマ区切り。未検出はnone |
+| stall_position | 0 / 1 / 2 / 3 | その軸の最新抵抗停止位置[deg]、小数3桁。未検出はunknown |
+| motion_outcome | 0 | running / arrived / resistance / stopped / abnormal |
 
 未開始区間は関節ごと1件まで。実行中の区間は数えません。
-feedback待ちの指令は未開始として数えます。joint_queue=0は全停止の意味ではありません。
-`busy`は計画が残っている間と最後のgoalの結果待ちです。最後のgoalは位置許容と停止速度許容を
-満たす成功結果でidleになります。途中で意図的に置換した旧goalの結果は失敗にしません。
-failedは致命的失敗、stoppedはstop後（cancel終端待ちはbusy）、reset後はidleです。
+feedback待ち・到着ゲート待ちの指令は未開始として数えます。joint_queue=0は全停止の意味ではありません。
+`busy`は計画・保持・ブリッジの到着確認または最後のAction結果が残る間です。
+Action成功だけでidleにはせず、計画終了、新鮮な4軸feedback、指令軸の軸別位置許容と
+実測速度<2°/sを確認します。Action成功後に未到着なら再送を繰り返さず観測を待ちます。
+途中で意図的に置換した旧goalの結果は失敗にしません。異常は`failed`をラッチします。
+**stopは通常停止としてstoppedを公開し、次の動作指令で自動解除します。resetは不要です。**
+受付済みの新指令もcancel終端までは新goalを送りません。既存failedをstopで解除することはできません。HTTPの通常commandはfailed中に400で拒否し、走行・直結関節の状態も更新しません。
+reporterとreset/stopは受け付けます。旧共通`trajectory_goal_tolerance_deg`は廃止しました。
 
-feedback途絶、送信待ち期限、リース切れ、Action拒否・許容違反・結果timeoutで計画を消去し、
+### 掘削抵抗による正常打切り
+
+新しいJointState観測ごとに、送信済み軌道の3次Hermite補間位置と実測を比較します。
+その関節の区間の指令方向へ計画が実測より`<axis>_load_stall_lead_deg`以上先行している間の、
+直近`<axis>_load_stall_window_sec=1.5`秒の実測角の最大−最小が`stall_motion_deg=0.5`°未満なら抵抗停止です。
+微振動の瞬間速度で窓を切りません。先行差不足・逆向き誤差・0.2秒超のサンプル間隔・
+同時刻・時刻逆行・非有限値では窓をリセットし、timerの再読込は観測に数えません。
+窓の左端をまたぐ1観測を含めて保守的に評価するため、周期1回分ほど遅れる場合があります。
+
+先行差の初期値はswing/boom=2.5°、arm/bucket=8.5°です。controllersのlever_start数値+0.5を
+保守的な初期目安としています。**lever_start/stopの実際の単位はレバー%で、角度への単位換算ではありません。**
+bringupはHTTP節の明示角度値を優先します。PID/FF/負荷に応じた実機較正が必要です。
+角度幅0.5°はdig3.csvの接触後の微振動・緩い沈み込み（boom約0.43°、arm後半約0.24°）を覆う初期値です。
+先行差が大きいまま1.5秒で0.5°未満しか進まない意図的な低速動作も、この入力だけでは抵抗と区別できません。
+armの接触直後の約1°の進行は止まった扱いにせず、幅が狭まるまで検出を待ちます。
+旧`load_stall_sec` / `load_stall_speed_deg_s`は廃止し、各軸の窓秒数 / 共通の角度幅へ移行しました。
+
+boom/arm/bucketの抵抗停止では、その軸の実行中・未来の区間を捨て、**検出時の実測位置そのもの・速度0**の
+保持goalへ置換します。保持位置はドリフト・到着ゲート・idle化・他軸の指令で更新しません。
+保持goalの受理後は出力マスクを維持し、他軸のgoalでも全軌道点に同じ保持角と速度0を含め、Action終点許容も有効にします。
+旧未達goalから保持goalへの受理待ち中だけは、旧目標への押し込みを避けるためその軸を一時抑止します。
+idle後も能動保持を続け、HTTPリース・実測鮮度の監視対象にします。
+他軸の区間・既存barrier時刻は保ち、ゲート後の保留指令は後続の明示指令として受け付けます。
+次の同軸明示指令は固定した停止位置を起点に通常動作へ戻り、その軸の能動保持を解除します。
+通常到着軸の出力抑止は従来どおりです。stop/reset/異常停止では能動保持と保留計画を破棄します。
+抵抗停止の履歴reporterはstopでは残し、resetで消去します。
+**swingの抵抗停止は障害物衝突の可能性があるため、全軸停止・failed / swing_load_stallです。**
+接地ガード中・保持静止確認中のboomは従来のground guard判定を優先し、この判定から除きます。
+
+`motion_outcome`は関節指令受付でrunning、到着完了でarrived、正常抵抗打切りでresistance、通常stopでstopped、異常でabnormal。
+連続するbusy区間で一度resistanceになればidleまで維持し、保持・他軸の完了は`motion_status=idle`で確認します。
+後続の新しいbusy区間はrunningへ戻ります。`stall_joints`と`stall_position`は各軸の最新検出をresetまで保存し、
+現在も止まっているという意味には使いません。swingの異常停止位置も記録します。
+全体期限超過は`motion_timeout`、非有限角度は直ちに`nonfinite_feedback`です。
+抵抗停止後の保持goal自体の拒否・許容違反・通信異常はfailedであり、抵抗として隠しません。
+
+feedback途絶・非有限、送信待ち期限、全体期限、リース切れ、Action拒否・許容違反・結果timeoutで計画を消去し、
 出力マスクを0、走行を0にしてcancelします。cancel応答だけでは完了にせず、goal終端までゲートを閉じます。
 heartbeatを一度受けるとリース監視が有効になり、その後のHTTP要求でも更新します。
 出力マスクは動作中の軸と未到達の追従軸を許可し、未来の待機区間だけで軸を許可しません。
+
+位置許容・速度上限・期限はいずれも正の有限値です。旧`serial_arrival_tolerance_deg`は廃止しました。
+bringupではcontrollers YAMLのHTTP節から設定できます（bringup README参照）。
 
 ## 主なROSパラメータ
 
@@ -110,8 +189,16 @@ heartbeatを一度受けるとリース監視が有効になり、その後のHT
 | trajectory_duration_sec | 3.0 | 速度未設定時の区間時間[s] |
 | 各関節_default_speed_deg_s | 0.0 | PID4軸の初期速度設定。0で未設定 |
 | joint_state_timeout_sec | 0.5 | feedback鮮度[s]。0で監視無効 |
-| trajectory_goal_tolerance_deg | 0.75 | 最後の位置許容 |
-| trajectory_stopped_velocity_deg_s | 0.5 | 最後の停止速度許容 |
+| swing_serial_arrival_tolerance_deg | 1.5 | val=1の旋回位置許容[deg] |
+| boom_serial_arrival_tolerance_deg | 2.5 | val=1のboom位置許容[deg] |
+| arm_serial_arrival_tolerance_deg / bucket_serial_arrival_tolerance_deg | 5.5 | val=1のarm/bucket位置許容[deg] |
+| serial_arrival_speed_deg_s | 2.0 | val=1の平滑実測角速度上限[deg/s]。未満で通過 |
+| serial_arrival_timeout_sec | 10.0 | 計画終了後の到着待ち上限[s]。正の有限値 |
+| 各軸_load_stall_lead_deg | 2.5 / 2.5 / 8.5 / 8.5 | 抵抗判定を始める指令方向の先行差[deg] |
+| 各軸_load_stall_window_sec | 1.5 | 抵抗を判定する実測角の窓[秒] |
+| stall_motion_deg | 0.5 | 窓内の最大−最小の上限[deg]（未満で停止） |
+| motion_timeout_sec | 240.0 | 最初の受付からidleまでの全体上限[s] |
+| trajectory_stopped_velocity_deg_s | 2.0 | JTCの停止速度許容[deg/s]。bridgeはserial_arrival_speed_deg_sで判定 |
 | max_dispatch_delay_sec | 1.0 | 最初のgoalの送信待ち上限[s] |
 | client_lease_sec | 2.0 | heartbeat有効化後の無通信上限[s] |
 | trajectory_goal_response_timeout_sec | 5.0 | 受理応答待ち上限[s] |
@@ -212,5 +299,11 @@ JTCの許容超過は、新鮮な実測停滞から保持へ移行でき、他�
 またはその保持より古いgoalの結果の場合だけ回復する。それ以外の失敗を隠さない。
 最終保持goalそのものの失敗、unknown・feedback異常、リース切れ、Action拒否・timeoutは
 計画破棄・走行ゼロ・cancelを行いfailedをラッチする。停止根拠や制御の成立が不明なため、
-Scratchも停止してreset後の再確認を求める。stopは実行中ガードをfailed、resetはreachedへ戻す。
+Scratchも停止してreset後の再確認を求める。通常stopはmotionをstopped、実行中ガードはfailedにする。
+次の動作指令でmotionのstoppedを自動解除する。ガードも新しい明示指令で再開でき、reset必須ではない。resetはガードをreachedへ戻す。
 stop/reset/failedで古い終点・保持目標を破棄し、cancel終端までは既存の送信ゲートを維持する。
+
+JTCへ送る終点位置許容は到着ゲートと同じ軸別値です。途中位置許容は120°、goal_timeは30秒を
+Actionに明示し、0や-1による無効化はしません。controllers_0.yamlも同じ値です。
+120°は通常の60°/s×1.5秒=90°に置換通信の余裕を取った緩い最終限界で、停止の主判定には使いません。
+独立した実機hardwareのレバー制限・可動域・速度保護は維持します。

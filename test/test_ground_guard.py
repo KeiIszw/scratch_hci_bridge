@@ -118,7 +118,8 @@ def test_node_contact_during_acceptance_and_replacement():
     assert h.sent[1][0].trajectory.points[-1].positions[1] == pytest.approx(math.radians(-49))
     h.result(1, now=.2)
     assert s.guard_status() == 'contact' and s.motion_status() == 1
-    s.update_from_joint_state(NAMES, [0, math.radians(-49), 2, 1], now=.7)
+    for t in (.58, .64, .7):
+        s.update_from_joint_state(NAMES, [0, math.radians(-49), 2, 1], now=t)
     s.update_ground_contact(1, now=.7)
     h.tick(.7); h.accept(2, now=.7); h.result(2, now=.71)
     assert s.motion_status() == 0

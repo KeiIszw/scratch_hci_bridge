@@ -34,7 +34,7 @@ from scratch_hci_bridge.trajectory_scheduler import (
     ScheduledTrajectory,
     TrajectoryScheduler,
 )
-from scratch_hci_bridge.trajectory_targets import PID_JOINTS
+from scratch_hci_bridge.trajectory_targets import PID_JOINTS, PID_ROS_TO_HTTP
 
 
 PID_HTTP_JOINT_NAMES = frozenset(http_name for http_name, _ in PID_JOINTS)
@@ -85,8 +85,7 @@ class ScratchHciBridge(Node):
             self.declare_parameter(f"{joint}_default_speed_deg_s", 0.0)
         self.declare_parameter("trajectory_duration_sec", 3.0)
         self.declare_parameter("joint_state_timeout_sec", 0.5)
-        self.declare_parameter("trajectory_goal_tolerance_deg", 0.75)
-        self.declare_parameter("trajectory_stopped_velocity_deg_s", 0.5)
+        self.declare_parameter("trajectory_stopped_velocity_deg_s", 2.0)
         self.declare_parameter("trajectory_goal_response_timeout_sec", 5.0)
         self.declare_parameter("trajectory_result_timeout_margin_sec", 35.0)
         self.declare_parameter("trajectory_shutdown_cancel_timeout_sec", 2.0)
@@ -114,12 +113,6 @@ class ScratchHciBridge(Node):
         )
         self._joint_state_timeout_sec = float(
             self.get_parameter("joint_state_timeout_sec").value
-        )
-        self._trajectory_goal_tolerance_deg = float(
-            self.get_parameter("trajectory_goal_tolerance_deg").value
-        )
-        self._trajectory_goal_tolerance_rad = math.radians(
-            self._trajectory_goal_tolerance_deg
         )
         self._trajectory_stopped_velocity_rad_s = math.radians(
             float(
@@ -187,13 +180,6 @@ class ScratchHciBridge(Node):
         ):
             raise ValueError(
                 "joint_state_timeout_sec must be finite and non-negative"
-            )
-        if (
-            not math.isfinite(self._trajectory_goal_tolerance_rad)
-            or self._trajectory_goal_tolerance_rad <= 0.0
-        ):
-            raise ValueError(
-                "trajectory_goal_tolerance_deg must be finite and greater than zero"
             )
         if (
             not math.isfinite(self._trajectory_stopped_velocity_rad_s)
@@ -287,6 +273,18 @@ class ScratchHciBridge(Node):
         self._ground_timeout_sec = ground_timeout
         self._trajectory_scheduler = TrajectoryScheduler(
             ground_timeout_sec=ground_timeout,
+            **{name: self.declare_parameter(name, default).value for name, default in (
+                ('swing_load_stall_lead_deg', 2.5), ('boom_load_stall_lead_deg', 2.5),
+                ('arm_load_stall_lead_deg', 8.5), ('bucket_load_stall_lead_deg', 8.5),
+                ('swing_load_stall_window_sec', 1.5), ('boom_load_stall_window_sec', 1.5),
+                ('arm_load_stall_window_sec', 1.5), ('bucket_load_stall_window_sec', 1.5),
+                ('stall_motion_deg', 0.5),
+                ('motion_timeout_sec', 240.0))},
+            **{f'{a}_serial_arrival_tolerance_deg': self.declare_parameter(
+                f'{a}_serial_arrival_tolerance_deg', v).value
+               for a, v in (('swing', 1.5), ('boom', 2.5), ('arm', 5.5), ('bucket', 5.5))},
+            serial_arrival_speed_deg_s=self.declare_parameter('serial_arrival_speed_deg_s', 2.0).value,
+            serial_arrival_timeout_sec=self.declare_parameter('serial_arrival_timeout_sec', 10.0).value,
             ground_slow_distance_m=self.declare_parameter('ground_slow_distance_m', 0.2).value,
             ground_slow_speed_deg_s=self.declare_parameter('ground_slow_speed_deg_s', 1.0).value,
             ground_stall_sec=self.declare_parameter('ground_stall_sec', 0.5).value,
@@ -335,6 +333,7 @@ class ScratchHciBridge(Node):
             self._motion_lock,
             joint_queue_callback=self._trajectory_scheduler.joint_queue,
             ground_reporter_callback=self._ground_reporter,
+            sensor_reporter_callback=self._sensor_reporter,
         )
         self._http_thread = threading.Thread(
             target=self._http_server.serve_forever,
@@ -369,7 +368,7 @@ class ScratchHciBridge(Node):
                 self._stop_motion(reset=command == "reset")
                 return
             if command == "barrier":
-                self._trajectory_scheduler.barrier()
+                self._trajectory_scheduler.barrier(arrival=value == 1)
                 return
             if command in ("left_crawler_speed", "right_crawler_speed"):
                 self._trajectory_scheduler.accept_motion()
@@ -423,6 +422,18 @@ class ScratchHciBridge(Node):
         self._trajectory_scheduler.update_ground_clearance(message.data, self._ground_clearance_at)
 
     @_motion_serialized
+    def _sensor_reporter(self, command, index):
+        """センサ値と終了理由はschedulerの同じ実測・判定状態を公開する。"""
+        scheduler = self._trajectory_scheduler
+        if command == 'joint_angle':
+            return scheduler.joint_angle(index)
+        if command == 'stall_position':
+            return scheduler.stall_position(index)
+        if command == 'stall_joints':
+            return scheduler.stall_joints()
+        return scheduler.motion_outcome()
+
+    @_motion_serialized
     def _ground_reporter(self, command):
         if command == 'guard_status':
             return self._trajectory_scheduler.guard_status()
@@ -437,6 +448,8 @@ class ScratchHciBridge(Node):
         self._trajectory_scheduler.update_from_joint_state(
             message.name, message.position
         )
+        if self._trajectory_scheduler.motion_status() == -1:
+            self._stop_motion(self._trajectory_scheduler.motion_error())
         self._refresh_active_axis_mask()
 
     @_motion_serialized
@@ -456,7 +469,8 @@ class ScratchHciBridge(Node):
     def _stop_motion(self, reason: str = "stopped", *, reset: bool = False) -> None:
         """HTTP応答は終端結果を待たず、cancelの要求だけを行う。"""
         previous_error = self._trajectory_scheduler.motion_error()
-        self._trajectory_scheduler.stop(reason, reset=reset)
+        # reset後のcancel待ちで空の理由を再通知しても、失敗ラッチを作り直さない。
+        self._trajectory_scheduler.stop(reason, reset=reset or reason == '')
         self._log_new_motion_failure(previous_error)
         self._state.stop_drive()
         self._stop_pending = bool(self._goal_response_future or self._active_goal_handle)
@@ -467,15 +481,21 @@ class ScratchHciBridge(Node):
     def _on_timer(self) -> None:
         now = time.monotonic()
         if (self._lease_enabled and now - self._last_http_at > self._client_lease_sec
-                and (self._trajectory_scheduler.has_work() or self._mask_catch_up_targets)):
+                and (self._trajectory_scheduler.has_work() or self._mask_catch_up_targets
+                     or self._trajectory_scheduler.resistance_held_axes())):
             self._stop_motion("lease_expired")
-        if self._mask_catch_up_targets and self._trajectory_scheduler.stale_feedback(now):
+        if ((self._mask_catch_up_targets or self._trajectory_scheduler.resistance_held_axes())
+                and self._trajectory_scheduler.stale_feedback(now)):
             self._stop_motion("stale")
         previous_error = self._trajectory_scheduler.motion_error()
         self._trajectory_scheduler.check_deadlines(now)
         reason = self._trajectory_scheduler.check_ground_guard(now)
         if reason:
             self._stop_motion(reason)
+        if (self._trajectory_scheduler.motion_error() != previous_error
+                and self._trajectory_scheduler.motion_status() == -1):
+            # Action完了後の到着待ちtimeoutでも、走行停止と出力マスク解除を実行する。
+            self._stop_motion(self._trajectory_scheduler.motion_error())
         self._log_new_motion_failure(previous_error)
         if self._trajectory_scheduler.needs_cancel() and not self._stop_pending:
             self._stop_motion(self._trajectory_scheduler.motion_error())
@@ -545,7 +565,7 @@ class ScratchHciBridge(Node):
             JointTolerance(
                 name=joint_name,
                 position=(
-                    self._trajectory_goal_tolerance_rad
+                    self._trajectory_scheduler.arrival_tolerance(PID_ROS_TO_HTTP[joint_name])
                     if joint_name in commanded_ros_joints
                     else -1.0
                 ),
@@ -557,6 +577,10 @@ class ScratchHciBridge(Node):
             )
             for joint_name in target.joint_names
         ]
+
+        # 抵抗の通常遅れはブリッジで打ち切る。JTCは大きな追従逸脱だけを安全限界として残す。
+        goal.path_tolerance = [JointTolerance(name=n, position=math.radians(120.0)) for n in target.joint_names]
+        goal.goal_time_tolerance = Duration(seconds=30.0).to_msg()
 
         # 全関節の境界を含む計画を送り、置換時にも実測へ巻き戻さない。
         goal.trajectory.points = []
@@ -625,6 +649,13 @@ class ScratchHciBridge(Node):
                 )
                 return
         for http_name, ros_name in PID_JOINTS:
+            if (getattr(self, '_trajectory_scheduler', None) is not None
+                    and http_name in self._trajectory_scheduler.serial_held_axes()):
+                continue
+            if (getattr(self, '_trajectory_scheduler', None) is not None
+                    and http_name in self._trajectory_scheduler.resistance_blocks_old_goal(scheduled)):
+                # 遅着した旧goalの位置出力で、固定保持角を未達目標へ戻さない。
+                continue
             if (http_name == 'boom' and getattr(self, '_trajectory_scheduler', None) is not None
                     and self._trajectory_scheduler.guard_blocks_old_boom(scheduled)):
                 # 応答待ち中に実測が下がった場合、位置出力側にも古い保持角を流さない。
@@ -655,10 +686,10 @@ class ScratchHciBridge(Node):
             self._trajectory_scheduler.targets_outside_tolerance(
                 self._trajectory_scheduler.tracking_targets() if scheduled.track_points else dict(zip(
                     (axis for axis, _ in PID_JOINTS), scheduled.target.positions_rad)),
-                self._trajectory_goal_tolerance_rad)
+                {a: self._trajectory_scheduler.arrival_tolerance(a) for a, _ in PID_JOINTS})
             if scheduled is not None and self._catch_up_axes_in_mask else {}
         )
-        self._write_active_axis_mask()
+        self._write_active_axis_mask(scheduled=getattr(self, '_active_goal_scheduled', None) or scheduled)
 
     def _refresh_active_axis_mask(self) -> None:
         if getattr(self, "_active_axis_mask_publisher", None) is None:
@@ -668,13 +699,19 @@ class ScratchHciBridge(Node):
         # 一度到達した軸は次の指令まで再許可せず、無関係な保持補正を再開しない。
         if self._mask_catch_up_targets:
             self._mask_catch_up_targets = self._trajectory_scheduler.targets_outside_tolerance(
-                self._mask_catch_up_targets, self._trajectory_goal_tolerance_rad,
+                self._mask_catch_up_targets,
+                {a: self._trajectory_scheduler.arrival_tolerance(a) for a, _ in PID_JOINTS},
             )
         self._write_active_axis_mask(only_if_changed=True)
 
-    def _write_active_axis_mask(self, *, only_if_changed: bool = False) -> None:
+    def _write_active_axis_mask(self, *, only_if_changed: bool = False, scheduled=None) -> None:
         active_joints = self._mask_commanded_axes | self._mask_catch_up_targets.keys()
         scheduler = getattr(self, '_trajectory_scheduler', None)
+        if scheduler is not None:
+            active_joints.difference_update(scheduler.serial_held_axes())
+            active_joints.update(scheduler.resistance_held_axes())
+            active_joints.difference_update(scheduler.resistance_blocks_old_goal(
+                scheduled or getattr(self, '_active_goal_scheduled', None)))
         blocks_old_boom = getattr(scheduler, 'guard_blocks_old_boom', None)
         if blocks_old_boom and blocks_old_boom(getattr(self, '_active_goal_scheduled', None)):
             # 接地後にAction応答が遅れても、旧目標への追従出力で下降を続けない。
@@ -743,6 +780,7 @@ class ScratchHciBridge(Node):
                 self._trajectory_scheduler.mark_completed(
                     scheduled, successful=False, reason="goal_rejected"
                 )
+                self._stop_motion("goal_rejected")
             self._publish_active_axis_mask()
             self.get_logger().error(
                 "Trajectory goal was rejected; reason=goal_rejected "
@@ -761,8 +799,9 @@ class ScratchHciBridge(Node):
             self._stop_motion(self._trajectory_scheduler.motion_error())
         if not getattr(self, "_stop_pending", False):
             is_guard_hold = getattr(self._trajectory_scheduler, 'is_guard_hold', None)
-            if is_guard_hold and is_guard_hold(scheduled):
-                # 受理前に下がった実測を優先し、古い保持位置への上昇をマスクで抑える。
+            if ((is_guard_hold and is_guard_hold(scheduled))
+                    or self._trajectory_scheduler.resistance_held_axes()):
+                # 受理済みの保持goalに切り替わった時点で、固定停止角への出力許可を反映する。
                 self._publish_active_axis_mask(scheduled)
             self._publish_unity_position_target(scheduled)
         if submission_started_at is None:
@@ -838,7 +877,7 @@ class ScratchHciBridge(Node):
             self._mask_commanded_axes.clear()
             self._refresh_active_axis_mask()
         else:
-            self._publish_active_axis_mask()
+            self._stop_motion(self._trajectory_scheduler.motion_error())
         if recovered_guard:
             self.get_logger().info('Guard retained measured hold after superseded tolerance result')
             return

@@ -12,6 +12,19 @@ def generate_launch_description() -> LaunchDescription:
             *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
                 ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0), ("ground_timeout_sec", 0.5),
                 ("ground_slow_distance_m", 0.2), ("ground_slow_speed_deg_s", 1.0),
+                *[ (f"{a}_serial_arrival_tolerance_deg", v) for a, v in
+                   (("swing", 1.5), ("boom", 2.5), ("arm", 5.5), ("bucket", 5.5))],
+                ("serial_arrival_speed_deg_s", 2.0), ("serial_arrival_timeout_sec", 10.0),
+                ("swing_load_stall_lead_deg", 2.5),
+                ("boom_load_stall_lead_deg", 2.5),
+                ("arm_load_stall_lead_deg", 8.5),
+                ("bucket_load_stall_lead_deg", 8.5),
+                ("swing_load_stall_window_sec", 1.5),
+                ("boom_load_stall_window_sec", 1.5),
+                ("arm_load_stall_window_sec", 1.5),
+                ("bucket_load_stall_window_sec", 1.5),
+                ("stall_motion_deg", 0.5),
+                ("motion_timeout_sec", 240.0),
                 ("ground_stall_sec", 0.5), ("ground_stall_epsilon_deg", 0.1))],
             DeclareLaunchArgument("ground_topic_prefix", default_value="/TB20e_0/ground"),
             DeclareLaunchArgument("excavator", default_value="tb20e"),
@@ -32,10 +45,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("trajectory_duration_sec", default_value="3.0"),
             DeclareLaunchArgument("joint_state_timeout_sec", default_value="0.5"),
             DeclareLaunchArgument(
-                "trajectory_goal_tolerance_deg", default_value="0.75"
-            ),
-            DeclareLaunchArgument(
-                "trajectory_stopped_velocity_deg_s", default_value="0.5"
+                "trajectory_stopped_velocity_deg_s", default_value="2.0"
             ),
             DeclareLaunchArgument(
                 "trajectory_goal_response_timeout_sec", default_value="5.0"
@@ -71,7 +81,20 @@ def generate_launch_description() -> LaunchDescription:
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
                            for name in ("client_lease_sec", "max_dispatch_delay_sec", "ground_timeout_sec",
                                         "ground_slow_distance_m", "ground_slow_speed_deg_s",
-                                        "ground_stall_sec", "ground_stall_epsilon_deg")},
+                                        "swing_load_stall_lead_deg",
+                                        "boom_load_stall_lead_deg",
+                                        "arm_load_stall_lead_deg",
+                                        "bucket_load_stall_lead_deg",
+                                        "swing_load_stall_window_sec",
+                                        "boom_load_stall_window_sec",
+                                        "arm_load_stall_window_sec",
+                                        "bucket_load_stall_window_sec",
+                                        "stall_motion_deg",
+                                        "motion_timeout_sec",
+                                        "ground_stall_sec", "ground_stall_epsilon_deg",
+                                        "swing_serial_arrival_tolerance_deg", "boom_serial_arrival_tolerance_deg",
+                                        "arm_serial_arrival_tolerance_deg", "bucket_serial_arrival_tolerance_deg",
+                                        "serial_arrival_speed_deg_s", "serial_arrival_timeout_sec")},
                         "ground_topic_prefix": LaunchConfiguration("ground_topic_prefix"),
                         "excavator": LaunchConfiguration("excavator"),
                         "publish_hz": ParameterValue(
@@ -102,10 +125,6 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "joint_state_timeout_sec": ParameterValue(
                             LaunchConfiguration("joint_state_timeout_sec"),
-                            value_type=float,
-                        ),
-                        "trajectory_goal_tolerance_deg": ParameterValue(
-                            LaunchConfiguration("trajectory_goal_tolerance_deg"),
                             value_type=float,
                         ),
                         "trajectory_stopped_velocity_deg_s": ParameterValue(

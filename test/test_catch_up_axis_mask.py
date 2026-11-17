@@ -86,11 +86,13 @@ def test_completion_preserves_only_catch_up_axes_until_measured_arrival(enabled)
     target = h.bridge._active_goal_scheduled.target.positions_rad
     feedback(h, now=1.1, bucket=target[3])
     h.result(1, now=2)
-    assert not h.scheduler.has_work()
+    assert h.scheduler.has_work()  # Action成功後も実測到着までbusyを維持する。
     assert mask(h) == (0b0010 if enabled else 0)
-    feedback(h, boom=-40.5, now=1.12, bucket=target[3])
-    h.tick(1.12)
+    for t in (2.02, 2.08, 2.14):
+        feedback(h, boom=-40.5, now=t, bucket=target[3])
+    h.tick(2.14)
     assert mask(h) == 0
+    assert not h.scheduler.has_work()
 
 
 @pytest.mark.parametrize('stop', ['stop', 'reset', 'lease', 'fatal', 'stale', 'result_timeout'])
@@ -127,7 +129,7 @@ def test_lease_also_stops_catch_up_after_last_action_completed():
     h.tick(0)
     h.accept(0)
     h.result(0, now=1)
-    assert not h.scheduler.has_work()
+    assert h.scheduler.has_work()
     assert mask(h) == 0b0010
     h.bridge._lease_enabled = True
     h.bridge._last_http_at = 0

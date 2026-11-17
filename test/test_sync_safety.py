@@ -28,13 +28,14 @@ class SafetyTest(unittest.TestCase):
         s.mark_submitted(goal)
         s.update_http_target('arm_extend', 10, now=.1)
         s.stop()
-        self.assertEqual(s.motion_status(), 1)
+        self.assertEqual(s.motion_status(), 2)
         self.assertTrue(all(s.joint_queue(i, now=0) == 0 for i in range(4)))
         self.assertIsNone(s.pending_snapshot(now=10))
         s.mark_completed(goal, successful=False)
         self.assertEqual(s.motion_status(), 2)
         self.assertEqual(s.motion_error(), 'stopped')
-        s.update_http_target('boom_up', 1, now=11)
+        self.assertTrue(s.update_http_target('boom_up', 1, now=11))
+        self.assertEqual(s.motion_error(), '')
         self.assertEqual(s.motion_status(), 1)
 
     def test_reset_clears_failure_and_pending_work(self):
@@ -272,12 +273,12 @@ class NodeSafetyTest(unittest.TestCase):
         b._active_axis_mask_publisher = publisher
         b._state.apply_command('left_crawler_speed', 1)
         b._command_callback('stop', 123)
-        self.assertEqual(s.motion_status(), 1)
+        self.assertEqual(s.motion_status(), 2)
         self.assertEqual(publisher.values[-1], 0)
         self.assertEqual(b._state.snapshot().left_crawler_speed, 0)
         b._goal_response_callback(response, goal)
         self.assertEqual(handle.cancel_calls, 1)
-        self.assertEqual(s.motion_status(), 1)
+        self.assertEqual(s.motion_status(), 2)
         b._goal_result_callback(result, goal)
         self.assertEqual(s.motion_status(), 2)
         self.assertEqual(s.motion_error(), 'stopped')
@@ -357,6 +358,9 @@ class PrefetchTest(unittest.TestCase):
                     s.stop(reset=state == 'reset')
                 arm = 140 if state == 'large_error' else 128.03
                 s.update_from_joint_state(NAMES, [math.radians(9.4), math.radians(-50), math.radians(arm), 1], now=1)
+                if state == 'failure':
+                    self.assertFalse(s.update_http_target('boom_down', 1, now=1))
+                    s.stop(reset=True)
                 s.update_http_target('boom_down', 1, now=1)
                 goal = s.pending_snapshot(now=1)
                 if state == 'retry':

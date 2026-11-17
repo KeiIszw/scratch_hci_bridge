@@ -11,7 +11,7 @@ from scratch_hci_bridge.command_state import CommandState
 from scratch_hci_bridge.http_server import create_http_server
 from scratch_hci_bridge.track_timeline import TrackTimeline
 from test_http_server import _get
-from test_sync_safety import scheduler
+from test_sync_safety import scheduler, NAMES
 from bridge_test_helpers import Harness, queue
 from test_catch_up_axis_mask import harness, mask
 
@@ -90,6 +90,8 @@ def test_queue_and_busy_through_final_result():
     s.mark_submitted(r, replacing=q)
     assert s.motion_status() == 1
     assert s.pending_snapshot(now=2, replacing=r) is None
+    for t in (1.88, 1.94, 2):
+        s.update_from_joint_state(NAMES, r.target.positions_rad, now=t)
     s.mark_completed(r, successful=True, now=2)
     assert s.motion_status() == 0
 
@@ -105,6 +107,9 @@ def test_stop_clears_all_tracks_and_rebases(reason, reset):
     assert all(s.joint_queue(i, now=.1) == 0 for i in range(4))
     assert s.track_active_axes(now=.1) == set()
     s.mark_completed(p, successful=False, now=.2)
+    if not reset and reason != 'stopped':
+        assert not add(s, now=.2)
+        s.stop(reset=True)
     assert add(s, now=.2)
     q = s.pending_snapshot(now=.2)
     assert math.degrees(q.target.positions_rad[1]) == pytest.approx(-40)
@@ -160,6 +165,8 @@ def test_node_replacement_ignores_preempted_results_and_keeps_plan(before_accept
     assert h.scheduler.motion_status() == 1
     h.tick(4)
     assert len(h.sent) == 2
+    for t in (3.88, 3.94, 4):
+        h.scheduler.update_from_joint_state(NAMES, h.bridge._active_goal_scheduled.target.positions_rad, now=t)
     h.result(1, now=4)
     assert h.scheduler.motion_status() == 0
 
@@ -234,7 +241,7 @@ def test_track_stop_during_replacement_response_and_rejection(reason):
     assert old.cancel_calls == new.cancel_calls == 1
     assert mask(h) == 0
     h.result(1, GoalStatus.STATUS_CANCELED, now=.4)
-    assert h.scheduler.motion_status() == (-1 if reason == 'lease' else 0 if reason == 'reset' else 2)
+    assert h.scheduler.motion_status() == (0 if reason == 'reset' else 2 if reason == 'stop' else -1)
 
 
 def test_subnanosecond_boundaries_do_not_duplicate_time_zero():

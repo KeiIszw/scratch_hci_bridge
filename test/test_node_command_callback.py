@@ -29,6 +29,9 @@ class _Scheduler:
         self.send_failures: list[Any] = []
         self.completions: list[tuple[Any, bool]] = []
 
+    def resistance_held_axes(self):
+        return set()
+
     def motion_error(self):
         return ''
 

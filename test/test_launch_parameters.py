@@ -52,7 +52,10 @@ def test_ground_slow_launch_parameters_are_typed_and_overridable():
     with patch('launch.logging.get_logger', return_value=logging.getLogger(__name__)):
         context = LaunchContext()
         context.launch_configurations.update(ground_slow_distance_m='0.15',ground_slow_speed_deg_s='1.5',
-            ground_stall_sec='0.7',ground_stall_epsilon_deg='0.08')
+            ground_stall_sec='0.7',ground_stall_epsilon_deg='0.08',
+            swing_serial_arrival_tolerance_deg='1.2', boom_serial_arrival_tolerance_deg='1.4',
+            arm_serial_arrival_tolerance_deg='5.2', bucket_serial_arrival_tolerance_deg='5.4',
+            serial_arrival_speed_deg_s='1.8', serial_arrival_timeout_sec='8.0')
         description = module.generate_launch_description()
         for action in description.entities:
             if isinstance(action, DeclareLaunchArgument): action.execute(context)
@@ -63,3 +66,8 @@ def test_ground_slow_launch_parameters_are_typed_and_overridable():
 
     assert parameters['ground_stall_sec']==.7
     assert parameters['ground_stall_epsilon_deg']==.08
+
+    for a, expected in (('swing',1.2),('boom',1.4),('arm',5.2),('bucket',5.4)):
+        assert parameters[a+'_serial_arrival_tolerance_deg'] == expected
+    assert parameters['serial_arrival_speed_deg_s'] == 1.8
+    assert parameters['serial_arrival_timeout_sec'] == 8.0

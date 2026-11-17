@@ -18,7 +18,7 @@ def feedback(s, t, boom=-50, distance=.1):
 
 def finish_hold(s, now):
     """検知後の静止確認と最終保持goalの終端まで進める。"""
-    for dt in (.1, .3, .6):
+    for dt in (.1, .3, .48, .54, .6):
         feedback(s, now+dt, math.degrees(s._guard_hold_position))
     goal = s.pending_snapshot(now=now+.6)
     assert s.mark_submitted(goal)
@@ -119,7 +119,8 @@ def test_overshoot_follows_measured_and_stale_hold_never_enables_upward_output()
     # 直後の成功で静止確認を飛ばさず、その後に固定された位置で完了する。
     h.result(2, now=.32)
     assert s.motion_status() == 1
-    feedback(s, .9, -48)
+    for t in (.78, .84, .9):
+        feedback(s, t, -48)
     h.tick(.9); h.accept(3, now=.9); h.result(3, now=.91)
     assert s.motion_status() == 0
     assert s.update_http_target('boom_up', 1, now=1)

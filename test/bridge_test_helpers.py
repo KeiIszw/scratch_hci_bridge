@@ -20,7 +20,6 @@ def _sending_bridge():
         safety.NAMES, [0.0, math.radians(-50), 2.0, 1.0], now=0
     )
     bridge._trajectory_duration_sec = 1.0
-    bridge._trajectory_goal_tolerance_rad = math.radians(0.75)
     bridge._trajectory_stopped_velocity_rad_s = math.radians(0.5)
     bridge._trajectory_client = Mock()
     bridge._trajectory_client.server_is_ready.return_value = True

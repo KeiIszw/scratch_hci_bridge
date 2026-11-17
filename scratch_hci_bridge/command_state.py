@@ -116,7 +116,9 @@ class CommandState:
     def apply_command(self, command: str, value: float) -> bool:
         if not math.isfinite(value):
             return False
-        if command in ("stop", "reset", "barrier", "boom_down_until_contact"):
+        if command == "barrier":
+            return value in (0, 1)
+        if command in ("stop", "reset", "boom_down_until_contact"):
             return True
         with self._lock:
             joint = ABSOLUTE_JOINT_COMMANDS.get(command)
