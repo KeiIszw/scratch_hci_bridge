@@ -38,7 +38,7 @@ def test_slow_joins_planned_position_once_and_preserves_barrier_order():
 
 def test_slow_never_accelerates_already_slow_motion_and_stale_distance_is_ignored():
     s=scheduler();s.update_ground_contact(0,now=0)
-    assert s.start_ground_guard(2,speed_limit_deg_s=.5,now=0)
+    assert s.start_ground_guard('boom_down', speed_limit_deg_s=.5,now=0, travel_deg=2)
     old=s._guard_segment
     s.update_ground_clearance(.1,now=-1);s.check_ground_guard(.1)
     assert s._guard_segment is old and not s._guard_slowed

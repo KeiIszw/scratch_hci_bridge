@@ -11,13 +11,15 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .command_state import (JOINT_LIMITS_DEG, ABSOLUTE_JOINT_COMMANDS,
-    RELATIVE_JOINT_COMMANDS, is_safe_relative_swing_command, is_ros_duration_safe,
+    RELATIVE_JOINT_COMMANDS, GUARD_MOTIONS, is_safe_relative_swing_command, is_ros_duration_safe,
     is_safe_pid_speed_limit)
 from .track_timeline import TrackTimeline, TrackPoint, TrackSegment
 from .guard_progress import ProgressWindow
 from .trajectory_targets import PID_JOINTS, PID_HTTP_TO_ROS, PID_ROS_TO_HTTP, TrajectoryTargetSnapshot
 
 _MIN_TRAJECTORY_DURATION_SEC = 0.001
+# 到着ゲートで保留した接地動作を、通常の角度指令と区別する印。
+_GUARD_HTTP_NAME = 'ground_guard'
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class TrajectoryScheduler:
 
     def __init__(self, feedback_timeout_sec=0.5, max_dispatch_delay_sec=1.0, ground_timeout_sec=0.5,
                  ground_slow_distance_m=0.2, ground_slow_speed_deg_s=1.0,
+                 arm_ground_slow_speed_deg_s=2.0, bucket_ground_slow_speed_deg_s=4.0,
                  ground_stall_sec=0.5, ground_stall_epsilon_deg=0.1,
                  swing_serial_arrival_tolerance_deg=1.5, boom_serial_arrival_tolerance_deg=2.5,
                  arm_serial_arrival_tolerance_deg=5.5, bucket_serial_arrival_tolerance_deg=5.5,
@@ -62,6 +65,7 @@ class TrajectoryScheduler:
         if not math.isfinite(ground_timeout_sec) or ground_timeout_sec <= 0:
             raise ValueError('ground_timeout_sec must be positive and finite')
         if not all(math.isfinite(v) and v > 0 for v in (ground_slow_distance_m, ground_slow_speed_deg_s,
+                arm_ground_slow_speed_deg_s, bucket_ground_slow_speed_deg_s,
                 ground_stall_sec, ground_stall_epsilon_deg)):
             raise ValueError('ground slow/stall parameters must be positive and finite')
         tolerances = dict(zip((a for a, _ in PID_JOINTS), (
@@ -107,13 +111,23 @@ class TrajectoryScheduler:
         self._guard_following = False
         self._guard_finishing = False
         self._ground_slow_distance_m = ground_slow_distance_m
-        self._ground_slow_speed_rad_s = math.radians(ground_slow_speed_deg_s)
+        # 接地前の減速速度。ground_slow_speed_deg_s はブーム用。回転半径が小さいアーム・バケットは、
+        # バケットが地面へ近づく速さがブームと同程度（約5cm/s）になるよう角速度を大きくする。
+        # バケットを1°/sにすると0.2mを下りるのに約20秒かかり、バケットの陰の地面が遮蔽保持の10秒を
+        # 過ぎて不明になり停止した（2026-11-26 Unity、bucket_dump）。
+        self._ground_slow_speeds_rad_s = {
+            'boom': math.radians(ground_slow_speed_deg_s), 'arm': math.radians(arm_ground_slow_speed_deg_s),
+            'bucket': math.radians(bucket_ground_slow_speed_deg_s)}
         self._ground_clearance, self._ground_clearance_at = float('nan'), float('-inf')
         self._ground_distances = deque(maxlen=5)
         self._guard_slowed = False
         self._ground_timeout_sec = ground_timeout_sec
         self._ground_value, self._ground_at = -1, float('-inf')
         self._guard_status = 'reached'
+        # 接地で止める関節と、地面へ近づく向き（関節角が増える向きを+1）。
+        self._guard_axis, self._guard_direction = 'boom', 1.0
+        # 距離指定の接地動作の目標距離[m]。接地で止める動作ではNone。
+        self._guard_clearance_target = None
         self._guard_segment = None
         self._guard_hold_revision = None
         self._lock = threading.RLock()
@@ -153,6 +167,14 @@ class TrajectoryScheduler:
         self._pending.clear()
         return True
 
+    def _deeper(self, a, b):
+        """接地動作の向きに進んだ方の角度を返す（ブーム下げならmax）。"""
+        return a if self._guard_direction*(a-b) >= 0 else b
+
+    def guard_axis(self):
+        with self._lock:
+            return self._guard_axis
+
     def update_http_target(self, command, degrees, speed_limit_deg_s=None, base_duration_sec=3.0, now=None):
         """絶対・相対指令を同じFIFOへ追加し、速度を受付時に固定する。"""
         relative = RELATIVE_JOINT_COMMANDS.get(command)
@@ -166,8 +188,8 @@ class TrajectoryScheduler:
         with self._lock:
             if self._motion_failed:
                 return False
-            # ガードの後にboom区間を予約すると停止後に再下降するため受付を制限する。
-            if axis == 'boom' and (self._guard_status == 'running' or self._guard_settling(current)):
+            # ガード中に同じ関節の区間を予約すると、停止後に再び動くため受付を制限する。
+            if axis == self._guard_axis and (self._guard_status == 'running' or self._guard_settling(current)):
                 return False
             index = [a for a, _ in PID_JOINTS].index(axis)
             if self.joint_queue(index, current):
@@ -183,7 +205,7 @@ class TrajectoryScheduler:
                     self._apply_track_entry(self._timeline, (cmd, base_duration_sec), current)
                 except ValueError:
                     return False
-            if axis == 'boom':
+            if axis == self._guard_axis:
                 self._guard_hold_position = self._guard_hold_revision = None
                 self._guard_finishing = False
             if self._motion_started_at is None:
@@ -219,9 +241,21 @@ class TrajectoryScheduler:
         with self._lock:
             return self._guard_status
 
-    def start_ground_guard(self, degrees, speed_limit_deg_s=None, base_duration_sec=3., now=None):
-        """unknown開始は拒否する。未確定の実測やcancel待ちからの下降も許可しない。"""
+    def start_ground_guard(self, motion='boom_down', speed_limit_deg_s=None, base_duration_sec=3., now=None,
+                           clearance_m=None, travel_deg=None):
+        """motionの向きへ可動域の端まで動かし、接地（距離指定なら目標距離以下）で止める。
+
+        HTTP指令は上限角を取らない（travel_deg=None）。地面が見つからなければ可動域の端に着いて
+        reached になる。travel_deg は区間の終点を近くに置いて終端処理を短時間で試すための引数で、
+        単体テストだけが使う。
+        unknown開始は拒否する。未確定の実測やcancel待ちからの開始も許可しない。
+        """
         current = time.monotonic() if now is None else now
+        if motion not in GUARD_MOTIONS:
+            return False
+        relative = RELATIVE_JOINT_COMMANDS[motion]
+        if clearance_m is not None and not (math.isfinite(clearance_m) and clearance_m >= 0):
+            return False
         with self._lock:
             if self._guard_status == 'running' or self._guard_settling(current):
                 return False
@@ -229,16 +263,31 @@ class TrajectoryScheduler:
                     or self._interrupting or self._motion_failed):
                 self._guard_status = 'failed'
                 return False
-            if not self.update_http_target('boom_down', degrees, speed_limit_deg_s, base_duration_sec, current):
+            axis = relative.joint
+            previous = (self._guard_axis, self._guard_direction, self._guard_hold_position,
+                        self._guard_hold_revision, self._guard_finishing, self._guard_following)
+            if axis != self._guard_axis:
+                # 前の関節の保持は通常の保持目標として残し、行き過ぎ追従だけを新しい関節へ移す。
+                self._guard_hold_position = self._guard_hold_revision = None
+                self._guard_finishing = self._guard_following = False
+            self._guard_axis, self._guard_direction = axis, relative.direction
+            lo, hi = JOINT_LIMITS_DEG[axis]
+            command, value = ((motion, travel_deg) if travel_deg is not None
+                              else (f'{axis}_angle', hi if relative.direction > 0 else lo))
+            if not self.update_http_target(command, value, speed_limit_deg_s, base_duration_sec, current):
+                # 受付できなかった時は、前の関節の保持状態を失わない。
+                (self._guard_axis, self._guard_direction, self._guard_hold_position,
+                 self._guard_hold_revision, self._guard_finishing, self._guard_following) = previous
                 self._guard_status = 'failed'
                 return False
             if self._arrival_gate:
-                # 保留中の下降を既存boom区間と取り違えて接地停止させない。
+                # 保留中の動作を既存区間と取り違えて接地停止させない。
                 cmd, duration = self._arrival_pending[-1]
-                self._arrival_pending[-1] = (replace(cmd, http_name='boom_down_until_contact'), duration)
+                self._arrival_pending[-1] = (replace(cmd, http_name=_GUARD_HTTP_NAME), duration)
                 self._guard_segment = None
             else:
-                self._guard_segment = self._timeline.axes['boom'][-1]
+                self._guard_segment = self._timeline.axes[axis][-1]
+            self._guard_clearance_target = clearance_m
             self._guard_hold_revision = None
             self._guard_status = 'running'
             self._guard_slowed = False
@@ -246,7 +295,7 @@ class TrajectoryScheduler:
             return True
 
     def check_ground_guard(self, now=None):
-        """接地時はboomだけを実測位置へ置換する。異常時は呼出し側の既存安全停止を使う。"""
+        """接地時は接地動作の関節だけを実測位置へ置換する。異常時は呼出し側の既存安全停止を使う。"""
         current = time.monotonic() if now is None else now
         with self._lock:
             if self._guard_status != 'running':
@@ -263,7 +312,15 @@ class TrajectoryScheduler:
             if self._guard_segment is None or current < self._guard_segment.start:
                 return None
             if contact == 0:
-                measured = self._feedback_positions_rad['boom']
+                axis = self._guard_axis
+                measured = self._feedback_positions_rad[axis]
+                clearance_fresh = (math.isfinite(self._ground_clearance)
+                                   and 0 <= current-self._ground_clearance_at <= self._ground_timeout_sec)
+                target = self._guard_clearance_target
+                if target is not None and clearance_fresh and self._ground_clearance <= target:
+                    # 距離指定は単発値で止める。誤って早く止まる側に倒れるだけで、押し込みは起きない。
+                    self._finish_guard('distance', current)
+                    return None
                 if (current >= self._guard_segment.end and
                         abs(measured-self._guard_segment.target) <= self._ground_stall_epsilon):
                     self._finish_guard('reached', current)
@@ -280,13 +337,14 @@ class TrajectoryScheduler:
                     self._finish_guard('stalled' if median(distances) < self._ground_slow_distance_m
                                        else 'blocked', current)
                     return None
-                if (not self._guard_slowed and math.isfinite(self._ground_clearance)
-                        and 0 <= current-self._ground_clearance_at <= self._ground_timeout_sec
-                        and self._ground_clearance < self._ground_slow_distance_m
+                # 距離指定では目標距離の手前0.2mから減速し、目標を行き過ぎにくくする。
+                slow_distance = self._ground_slow_distance_m + (target or 0.)
+                if (not self._guard_slowed and clearance_fresh
+                        and self._ground_clearance < slow_distance
                         and current < self._guard_segment.end):
                     try:
-                        replacement = self._timeline.slow_remaining('boom', self._guard_segment,
-                            current, self._ground_slow_speed_rad_s, measured=measured)
+                        replacement = self._timeline.slow_remaining(axis, self._guard_segment,
+                            current, self._ground_slow_speeds_rad_s[axis], measured=measured)
                     except ValueError:
                         self._guard_status = 'failed'
                         return 'invalid_trajectory'
@@ -306,27 +364,27 @@ class TrajectoryScheduler:
         segment = self._guard_segment
         if now >= segment.end:
             # 計画終了後は予定速度がゼロでも未到達の実測停滞を打ち切る必要がある。
-            return abs(segment.target-self._feedback_positions_rad['boom']) + 2*self._ground_stall_epsilon
+            return abs(segment.target-self._feedback_positions_rad[self._guard_axis]) + 2*self._ground_stall_epsilon
         return abs(self._guard_command_position(now)-self._guard_command_position(now-self._ground_stall_sec))
 
     def _guard_command_position(self, now):
-        """JTCの停止端Hermite補間で、実測に対して下降要求があるかを評価する。"""
+        """JTCの停止端Hermite補間で、実測に対して地面へ近づく要求があるかを評価する。"""
         segment = self._guard_segment
         duration = segment.end-segment.start
-        velocity = self._timeline.state('boom', segment.start)[1]
+        velocity = self._timeline.state(self._guard_axis, segment.start)[1]
         u = max(0., min(1., (now-segment.start)/duration))
         return (segment.origin + (3*u*u-2*u*u*u)*(segment.target-segment.origin)
                 + (u*u*u-2*u*u+u)*duration*velocity)
 
     def _guard_settling(self, now):
-        """接地後も下がっている間は次のboom指令と完了を待たせる。"""
+        """接地後も惰性で動いている間は、同じ関節の次の指令と完了を待たせる。"""
         return self._guard_finishing and not self._guard_progress.stalled()
 
     def _finish_guard(self, status, now):
-        """下降の終点を捨て、検知角へ戻さず実測の停止位置で保持する。"""
+        """動作の終点を捨て、検知角へ戻さず実測の停止位置で保持する。"""
         self._guard_status = status
         self._guard_segment = None
-        self._guard_hold_position = self._feedback_positions_rad['boom']
+        self._guard_hold_position = self._feedback_positions_rad[self._guard_axis]
         self._guard_following = True
         self._guard_finishing = True
         self._guard_progress.samples.clear()
@@ -334,43 +392,46 @@ class TrajectoryScheduler:
         self._replace_guard_hold(now)
 
     def _replace_guard_hold(self, now):
-        """boomの正方向が下降。行き過ぎた分だけ追従し、上昇側へ目標を戻さない。"""
-        measured = self._feedback_positions_rad['boom']
-        self._guard_hold_position = max(self._guard_hold_position, measured)
-        # 外力で上がった場合も上方向の目標は作らず、従来の最深位置を保つ。
+        """地面へ近づく向きに行き過ぎた分だけ追従し、離れる側へ目標を戻さない。"""
+        axis = self._guard_axis
+        measured = self._feedback_positions_rad[axis]
+        self._guard_hold_position = self._deeper(self._guard_hold_position, measured)
+        # 外力で戻された場合も離れる向きの目標は作らず、従来の最深位置を保つ。
         position = self._guard_hold_position
-        self._timeline.axes['boom'] = [TrackSegment(now, now+.001, position, position)]
+        self._timeline.axes[axis] = [TrackSegment(now, now+.001, position, position)]
         self._timeline.revision += 1
         self._timeline.barrier_time = max([now] + [s.end for ss in self._timeline.axes.values() for s in ss])
         self._revision += 1
-        self._commands = [c for c in self._commands if c.joint_name != 'boom']
-        self._commands.append(QueuedMotionCommand('boom_angle', 'boom', math.degrees(position), self._revision))
-        self._commanded_targets_rad['boom'] = position
+        self._commands = [c for c in self._commands if c.joint_name != axis]
+        self._commands.append(QueuedMotionCommand(axis+'_angle', axis, math.degrees(position), self._revision))
+        self._commanded_targets_rad[axis] = position
         self._guard_hold_revision = self._revision
 
     def is_guard_hold(self, scheduled):
         with self._lock:
             return self._guard_hold_revision is not None and scheduled.target.revision == self._guard_hold_revision
 
-    def guard_blocks_old_boom(self, scheduled):
-        """検知直後とドリフト中の古い保持goalにはboom出力を許可しない。"""
+    def guard_blocks_old_target(self, scheduled):
+        """検知直後とドリフト中の古い保持goalには、接地動作の関節の出力を許可しない。"""
         with self._lock:
+            index = [a for a, _ in PID_JOINTS].index(self._guard_axis)
+            measured = self._feedback_positions_rad[self._guard_axis] if self._guard_hold_revision is not None else 0.
             return (self._guard_hold_revision is not None and
                     (scheduled is None or scheduled.target.revision < self._guard_hold_revision
-                     or scheduled.target.positions_rad[1] < self._feedback_positions_rad['boom']))
+                     or self._guard_direction*(scheduled.target.positions_rad[index]-measured) < 0))
 
     def _append(self, timeline, command, duration, now):
         axis = command.joint_name
         segments = timeline.axes[axis]
         basis = segments[-1].target if segments else timeline.basis[[a for a, _ in PID_JOINTS].index(axis)]
-        if axis == 'boom' and self._guard_hold_position is not None:
-            basis = max(basis, self._feedback_positions_rad['boom'])
+        if axis == self._guard_axis and self._guard_hold_position is not None:
+            basis = self._deeper(basis, self._feedback_positions_rad[axis])
         if axis in self._stall_basis_axes:
             # 抵抗で未達の計画終点は捨て、次の明示指令は固定した停止位置から再開する。
             basis = self._resistance_holds[axis]
         target = _resolve_target_position_rad(axis, basis, command)
         duration = _required_duration_sec(axis, command, target, basis, duration)
-        if axis == 'boom' and self._guard_hold_position is not None and segments:
+        if axis == self._guard_axis and self._guard_hold_position is not None and segments:
             # 保持後の次の明示指令も、行き過ぎ前の古い角を相対基準にしない。
             segments[-1] = replace(segments[-1], origin=basis, target=basis)
         hold = self._serial_holds.get(axis)
@@ -399,8 +460,8 @@ class TrajectoryScheduler:
         else:
             command, duration = entry
             self._append(timeline, command, duration, now)
-            if command.http_name == 'boom_down_until_contact':
-                self._guard_segment = timeline.axes['boom'][-1]
+            if command.http_name == _GUARD_HTTP_NAME:
+                self._guard_segment = timeline.axes[command.joint_name][-1]
 
     def barrier(self, now=None, *, arrival=False):
         """val=1だけ実測到着も待ち、val=0は従来の計画時刻で区切る。"""
@@ -485,10 +546,11 @@ class TrajectoryScheduler:
                 velocities=tuple(0. if a in self._serial_holds and current+p.time < self._serial_holds[a][1]
                                  else p.velocities[i] for i, (a, _) in enumerate(PID_JOINTS))) for p in points)
             if self._guard_hold_position is not None:
-                # 静止確定後の微小な行き過ぎも、他軸追加によるgoal再送で上向きに戻さない。
-                position = max(self._guard_hold_position, self._feedback_positions_rad['boom'])
-                points = tuple(replace(p, positions=p.positions[:1]+(position,)+p.positions[2:],
-                                       velocities=p.velocities[:1]+(0.,)+p.velocities[2:]) for p in points)
+                # 静止確定後の微小な行き過ぎも、他軸追加によるgoal再送で地面から離れる向きに戻さない。
+                index = [a for a, _ in PID_JOINTS].index(self._guard_axis)
+                position = self._deeper(self._guard_hold_position, self._feedback_positions_rad[self._guard_axis])
+                points = tuple(replace(p, positions=p.positions[:index]+(position,)+p.positions[index+1:],
+                                       velocities=p.velocities[:index]+(0.,)+p.velocities[index+1:]) for p in points)
             if len(points) == 1:
                 points += (replace(points[0], time=_MIN_TRAJECTORY_DURATION_SEC),)
             self._next_dispatch_id += 1
@@ -522,7 +584,8 @@ class TrajectoryScheduler:
             if self._timeline is not None:
                 self._commanded_targets_rad.update({a: ss[-1].target for a, ss in self._timeline.axes.items() if ss})
             if self._guard_hold_position is not None:
-                self._commanded_targets_rad['boom'] = max(self._guard_hold_position, self._feedback_positions_rad['boom'])
+                self._commanded_targets_rad[self._guard_axis] = self._deeper(
+                    self._guard_hold_position, self._feedback_positions_rad[self._guard_axis])
             return True
 
     def mark_send_failed(self, scheduled):
@@ -555,11 +618,11 @@ class TrajectoryScheduler:
             if not successful and reason == 'tolerance_violated' and self._guard_status == 'running':
                 # JTC終端がタイマーより先でも、実測停滞と他軸の到達を確認できる場合だけ回復する。
                 others = {c.joint_name: scheduled.target.positions_rad[[a for a, _ in PID_JOINTS].index(c.joint_name)]
-                          for c in scheduled.commands if c.joint_name != 'boom'}
+                          for c in scheduled.commands if c.joint_name != self._guard_axis}
                 if not self.stale_feedback(current) and not self.targets_outside_tolerance(others, math.radians(.75)):
                     self.check_ground_guard(current)
             others = {c.joint_name: scheduled.target.positions_rad[[a for a, _ in PID_JOINTS].index(c.joint_name)]
-                      for c in scheduled.commands if c.joint_name != 'boom'}
+                      for c in scheduled.commands if c.joint_name != self._guard_axis}
             recoverable = (not successful and reason == 'tolerance_violated'
                            and self._guard_hold_revision is not None
                            and self._guard_status in ('contact', 'stalled', 'reached', 'blocked')
@@ -667,9 +730,62 @@ class TrajectoryScheduler:
         """抵抗は固定停止角、接地は行き過ぎ後の実測、通常は理想目標を相対基準にする。"""
         if joint in self._stall_basis_axes:
             return self._resistance_holds[joint]
-        if joint == 'boom' and self._guard_hold_position is not None:
-            return max(measured, self._commanded_targets_rad.get(joint, measured))
+        if joint == self._guard_axis and self._guard_hold_position is not None:
+            return self._deeper(measured, self._commanded_targets_rad.get(joint, measured))
         return self._commanded_targets_rad.get(joint, measured)
+
+    def stop_axis(self, axis, now=None):
+        """1関節だけを今の実測位置で止めて保つ。他の関節の計画はそのまま続ける。
+
+        接地動作中の関節なら終わり方を halted にし、惰性の行き過ぎも接地時と同じく追従して保持する。
+        実測が古い・動作異常中は受け付けない（止める位置が決まらないため）。
+        """
+        current = time.monotonic() if now is None else now
+        with self._lock:
+            if self._motion_failed or not self._feedback_is_fresh(axis, current):
+                return False
+            def same_axis(entry):
+                return not isinstance(entry, bool) and entry[0].joint_name == axis
+            if axis == self._guard_axis and self._guard_status == 'running':
+                if self._guard_segment is None:
+                    # 到着ゲートで保留中の接地動作はまだ始まっていないので、保留から外すだけでよい。
+                    self._arrival_pending = [e for e in self._arrival_pending if not same_axis(e)]
+                    self._pending = [e for e in self._pending if not same_axis(e)]
+                    self._commands = [c for c in self._commands if c.joint_name != axis]
+                    self._guard_status = 'halted'
+                    return True
+                self._finish_guard('halted', current)
+                return True
+            self._arrival_pending = [e for e in self._arrival_pending if not same_axis(e)]
+            self._pending = [e for e in self._pending if not same_axis(e)]
+            if self._timeline is None or not self._timeline.axes[axis]:
+                return True
+            measured = self._feedback_positions_rad[axis]
+            self._timeline.axes[axis] = [TrackSegment(current, current+.001, measured, measured)]
+            self._timeline.revision += 1
+            self._revision += 1
+            self._commands = [c for c in self._commands if c.joint_name != axis]
+            self._commands.append(QueuedMotionCommand(axis+'_angle', axis, math.degrees(measured), self._revision))
+            self._commanded_targets_rad[axis] = measured
+            self._ready_at = current if self._in_flight is None else self._ready_at
+            return True
+
+    def axis_moving(self, index, now=None):
+        """関節が止まったかを返す。'1'=動いている、'0'=止まった、'unknown'=実測が古い。
+
+        計画の残り、接地後の惰性、実測速度のどれかがあれば動いているとみなす。
+        """
+        current = time.monotonic() if now is None else now
+        axis = PID_JOINTS[index][0]
+        with self._lock:
+            if not self._feedback_is_fresh(axis, current):
+                return 'unknown'
+            planned = self._timeline is not None and any(current < s.end for s in self._timeline.axes[axis])
+            queued = any(not isinstance(e, bool) and e[0].joint_name == axis
+                         for e in (*self._pending, *self._arrival_pending))
+            settling = axis == self._guard_axis and (self._guard_status == 'running' or self._guard_settling(current))
+            moving = planned or queued or settling or self.feedback_speed(axis) >= self._serial_arrival_speed
+            return '1' if moving else '0'
 
     def stop(self, reason='stopped', *, reset=False):
         """計画を捨てて実測基準へ戻し、送信済みgoalの終端まではゲートを保持する。"""
@@ -798,22 +914,23 @@ class TrajectoryScheduler:
                 self._feedback_positions_rad[http_name] = position_rad
                 self._feedback_updated_at[http_name] = current_time
                 self._observe_load_stall(http_name, current_time)
-                if http_name == 'boom' and (self._guard_status == 'running' or self._guard_hold_position is not None):
+                if http_name == self._guard_axis and (self._guard_status == 'running' or self._guard_hold_position is not None):
                     if ((self._guard_segment is not None and current_time >= self._guard_segment.start)
                             or self._guard_hold_position is not None):
                         # 計画が実測に追いつく待ち時間は、障害物による停滞ではない。
-                        if (self._guard_segment is not None and
-                                self._guard_command_position(current_time)-position_rad <= self._ground_stall_epsilon):
+                        if (self._guard_segment is not None and self._guard_direction*(
+                                self._guard_command_position(current_time)-position_rad) <= self._ground_stall_epsilon):
                             self._guard_progress.samples.clear()
                         else:
                             self._guard_progress.update(current_time, position_rad)
-                    if self._guard_hold_position is not None and self._guard_following and position_rad > self._guard_hold_position:
+                    if (self._guard_hold_position is not None and self._guard_following
+                            and self._guard_direction*(position_rad-self._guard_hold_position) > 0):
                         if self._timeline is not None:
                             self._replace_guard_hold(current_time)
                         else:
                             # 正常終端後の微小ドリフトも次回の相対指令の古い基準にしない。
                             self._guard_hold_position = position_rad
-                            self._commanded_targets_rad['boom'] = position_rad
+                            self._commanded_targets_rad[http_name] = position_rad
                     if self._guard_hold_position is not None and self._guard_progress.stalled():
                         self._guard_following = False
 
@@ -867,7 +984,7 @@ class TrajectoryScheduler:
         """先行差がある期間の角度幅で判定し、微振動で観測時間を切らない。"""
         if (self._timeline is None or self._interrupting or self._motion_failed
                 or axis in self.serial_held_axes(now)
-                or (axis == 'boom' and (self._guard_status == 'running' or self._guard_finishing))):
+                or (axis == self._guard_axis and (self._guard_status == 'running' or self._guard_finishing))):
             self._stall_samples[axis].clear()
             return
         segments = [s for s in self._timeline.axes[axis] if s.start <= now]

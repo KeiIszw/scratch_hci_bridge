@@ -157,7 +157,11 @@ class CommandStateTest(unittest.TestCase):
             "left_crawler_speed",
             "right_crawler_speed",
         }
-        expected_commands.update(("stop", "reset", "barrier", "boom_down_until_contact"))
+        expected_commands.update(("stop", "reset", "barrier"))
+        guard_motions = ("boom_down", "arm_extend", "arm_retract", "bucket_scoop", "bucket_dump")
+        expected_commands.update(f"{m}_until_contact" for m in guard_motions)
+        expected_commands.update(f"{m}_until_clearance" for m in guard_motions)
+        expected_commands.update(("boom_stop", "arm_stop", "bucket_stop"))
         self.assertEqual(SUPPORTED_COMMANDS, expected_commands)
 
         joint_commands = {

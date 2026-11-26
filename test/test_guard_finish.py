@@ -50,7 +50,7 @@ def test_timer_without_new_feedback_does_not_count_as_stall():
 def test_long_cubic_start_does_not_false_stall_before_commanded_progress():
     s = scheduler()
     s.update_ground_contact(0, now=0)
-    assert s.start_ground_guard(40, speed_limit_deg_s=.2, now=0)
+    assert s.start_ground_guard('boom_down', speed_limit_deg_s=.2, now=0, travel_deg=40)
     for t in (.1, .3, .61):
         feedback(s, t)
         s.check_ground_guard(t)

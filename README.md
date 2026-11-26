@@ -237,10 +237,34 @@ launchでもこれらのパラメータを指定できる。
 |---|---|
 | ground_clearance | m、小数3桁。非有限値・受信途絶は `unknown` |
 | ground_contact | `1` / `0` / `unknown` |
-| guard_status | `running` / `contact` / `stalled` / `reached` / `blocked` / `failed` |
+| guard_status | `running` / `contact` / `stalled` / `reached` / `blocked` / `distance` / `halted` / `failed` |
 
-`boom_down_until_contact`（val=最大下げ角度[deg]、符号無視）は、boom_downと同じ速度・可動域・
-FIFO・barrierで区間を予約する。新鮮な接地情報と4軸feedbackが揃わない開始は400で拒否し、
+| reporter（val=0〜3＝swing/boom/arm/bucket） | 本文 |
+|---|---|
+| axis_moving | `1`＝計画の残り・接地後の惰性・実測速度2°/s以上のどれかがある、`0`＝止まった、`unknown`＝実測が古い |
+
+接地動作の指令（2026-11-26に関節と止め方を拡張）:
+
+| 指令 | val | 動き |
+|---|---|---|
+| `boom_down_until_contact`、`arm_extend_until_contact`、`arm_retract_until_contact`、`bucket_scoop_until_contact`、`bucket_dump_until_contact` | 使わない（0） | その向きへ可動域の端まで動かし、接地で止める |
+| `<上の5方向>_until_clearance` | 目標距離[m]（0〜3） | 地面との距離が val 以下になったら止める（`distance`） |
+| `boom_stop`、`arm_stop`、`bucket_stop` | 使わない（0） | その関節だけを実測位置で止めて保持する。他の関節の計画は続く |
+
+接地動作は上限角を取らない。地面が見つからなければ可動域の端に着いて `reached` になる。
+boom_up は姿勢によらずバケットを持ち上げるので対象外。地面との距離はバケット面の最小なので、
+どの関節で近づけても同じ値で判定できる。以下の説明はブームで書くが、他の関節も同じで、
+「下降」は各関節の地面へ近づく向き（boom_down・arm_retract・bucket_scoopは角度の正方向、
+arm_extend・bucket_dumpは負方向）に読み替える。保持・行き過ぎ追従・軸マスクの禁止は、
+最後に始めた接地動作の関節に対して働く。別の関節で接地動作を始めると、前の関節の保持は
+通常の保持目標として残り、行き過ぎ追従だけが新しい関節へ移る。
+
+距離指定は単発の距離が目標以下で止める（誤って早く止まる側に倒れるだけで押し込みは起きないため、
+中央値は使わない）。減速は目標距離＋`ground_slow_distance_m`から始める。目標より先に接地すれば `contact`。
+`<関節>_stop` は接地動作中なら終わり方を `halted` にし、接地時と同じく惰性の行き過ぎを追従して保持する。
+実測が古い・動作異常中は受け付けず、安全停止（`axis_stop_rejected`）する。
+
+区間は boom_down と同じ速度・FIFO・barrierで予約する。新鮮な接地情報と4軸feedbackが揃わない開始は400で拒否し、
 既存の安全停止経路で `ground_guard_rejected` をラッチする。reset後に再試行する。
 開始前の未知領域へブームを下げると停止根拠を持てないため、unknownのまま進めない。
 
@@ -249,6 +273,10 @@ Scratchのガード二重起動など、ガード開始要求の拒否は安全�
 区間がbarrierで未来に予約された場合は、開始時刻から接地による保持を適用する。
 実行区間で新鮮な`ground_clearance`が`ground_slow_distance_m=0.2`m未満になったら、
 残りのboom下降を`ground_slow_speed_deg_s=1.0`°/s以下へ一度だけ減速する。両値はlaunchでも設定可能。
+アーム・バケットの接地動作は `arm_ground_slow_speed_deg_s=2.0`、`bucket_ground_slow_speed_deg_s=4.0` を使う。
+回転半径が小さい関節でも、バケットが地面へ近づく速さをブームと同程度（約5cm/s）にするため。
+バケットを1°/sにすると0.2mを下りるのに約20秒かかり、バケットの陰の地面が遮蔽保持（10秒）を過ぎて
+unknownになり停止した（2026-11-26 Unity）。
 計画現在位置と実測のうち下降側に進んだ方を新しい起点にし、上方向へ戻さない。
 実測が終点を越えていれば実測位置で止める。距離が増えても再加速しない。既に十分遅い区間は変更しない。
 実測へ起点を変更した場合は始端速度0でつなぎ、上向きの位置・速度を生成しない。
@@ -266,7 +294,9 @@ JTCの3次補間で最大速度が平均の1.5倍になるため、残所要時�
 | running | barrier待ち、または下降中 | なし |
 | contact | 推定接地（ground_sensingで連続観測・急落除去済み） | なし |
 | stalled | 新鮮な距離の直近5観測中央値が0.2m未満でboomが停滞。接地扱いで保持 | なし |
-| reached | 指定角度へ到達し、推定接地なし。実測位置で保持 | なし |
+| reached | 可動域の端へ到達し、推定接地なし。実測位置で保持 | なし |
+| distance | 距離指定の接地動作で、地面との距離が目標以下になった。実測位置で保持 | なし |
+| halted | `<関節>_stop` で止めた。実測位置で保持 | なし |
 | blocked | 距離中央値が0.2m以上で停滞。障害物の可能性として保持 | なし |
 | failed | センサーunknown/途絶、角度途絶、Action拒否などの異常 | あり、reset必須 |
 

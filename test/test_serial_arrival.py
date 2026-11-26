@@ -205,7 +205,7 @@ def test_guard_waits_behind_gate_then_contact_updates_arrival_target():
     assert add(s, command='arm_extend')
     s.barrier(now=.1, arrival=True)
     s.update_ground_contact(0, now=.1)
-    assert s.start_ground_guard(10, 10, now=.1)
+    assert s.start_ground_guard('boom_down', 10, now=.1, travel_deg=10)
     assert s._guard_segment is None
     s.mark_submitted(s.pending_snapshot(now=.1))
     s.update_ground_contact(1, now=.5)
@@ -283,7 +283,7 @@ def test_guard_slowdown_moves_arrival_deadline_and_target():
     """接地減速で延びた計画時刻より前にゲートを期限切れにしない。"""
     s = scheduler()
     s.update_ground_contact(0, now=0)
-    assert s.start_ground_guard(10, 10, now=0)
+    assert s.start_ground_guard('boom_down', 10, now=0, travel_deg=10)
     s.barrier(now=.1, arrival=True)
     assert add(s, command='arm_extend', now=.1)
     s.mark_submitted(s.pending_snapshot(now=0))

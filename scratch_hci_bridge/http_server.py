@@ -57,9 +57,9 @@ class ScratchHTTPRequestHandler(BaseHTTPRequestHandler):
         # Scratchから動作完了を確認する要求。ここでは新しい動作指令を登録しない。
         if query["type"] == ["reporter"]:
             if (len(query['cmd']) == 1 and query['cmd'][0] in
-                    ('joint_angle', 'stall_joints', 'stall_position', 'motion_outcome')):
+                    ('joint_angle', 'stall_joints', 'stall_position', 'motion_outcome', 'axis_moving')):
                 command = query['cmd'][0]
-                allowed = ('0', '1', '2', '3') if command in ('joint_angle', 'stall_position') else ('0',)
+                allowed = ('0', '1', '2', '3') if command in ('joint_angle', 'stall_position', 'axis_moving') else ('0',)
                 callback = type(self).sensor_reporter_callback
                 if len(query['val']) != 1 or query['val'][0] not in allowed or callback is None:
                     self._send_text(400, 'invalid sensor reporter val')

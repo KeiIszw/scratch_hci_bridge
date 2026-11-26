@@ -353,7 +353,7 @@ def test_stop_discards_guard_or_active_hold_and_accepts_next_command_without_res
     s = scheduler()
     if state == 'guard':
         s.update_ground_contact(0, now=0)
-        assert s.start_ground_guard(30, 15, now=0)
+        assert s.start_ground_guard('boom_down', 15, now=0, travel_deg=30)
         goal = s.pending_snapshot(now=0); s.mark_submitted(goal)
     else:
         goal = submitted(s, 'boom_down')

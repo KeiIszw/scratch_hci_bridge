@@ -59,11 +59,25 @@ JOINT_LIMITS_DEG = {
     "thumb": (0.0, 140.0),
 }
 
+# 接地まで動かす向き。バケットの地面との距離はどの関節で近づけても同じ値を使えるので、
+# 地面へ近づき得る5方向を対象にする（boom_upは姿勢によらずバケットを持ち上げるため除く）。
+GUARD_MOTIONS = ("boom_down", "arm_extend", "arm_retract", "bucket_scoop", "bucket_dump")
+# 接地で止める指令（値は使わない）と、地面との距離[m]が値以下になったら止める指令。
+GUARD_CONTACT_COMMANDS = {f"{motion}_until_contact": motion for motion in GUARD_MOTIONS}
+GUARD_CLEARANCE_COMMANDS = {f"{motion}_until_clearance": motion for motion in GUARD_MOTIONS}
+# 1関節だけを実測位置で止める指令。旋回は障害物に当たる恐れがあり単独停止を想定しないため除く。
+AXIS_STOP_COMMANDS = {f"{joint}_stop": joint for joint in ("boom", "arm", "bucket")}
+# 距離指定の上限。地図のz範囲（-3〜4m）を超える距離は観測できない。
+MAX_GUARD_CLEARANCE_M = 3.0
+
 SUPPORTED_COMMANDS = (
         frozenset(ABSOLUTE_JOINT_COMMANDS)
     | frozenset(JOINT_SPEED_COMMANDS)
     | frozenset(RELATIVE_JOINT_COMMANDS)
-    | frozenset(("left_crawler_speed", "right_crawler_speed", "stop", "reset", "barrier", "boom_down_until_contact"))
+    | frozenset(GUARD_CONTACT_COMMANDS)
+    | frozenset(GUARD_CLEARANCE_COMMANDS)
+    | frozenset(AXIS_STOP_COMMANDS)
+    | frozenset(("left_crawler_speed", "right_crawler_speed", "stop", "reset", "barrier"))
 )
 
 
@@ -118,8 +132,10 @@ class CommandState:
             return False
         if command == "barrier":
             return value in (0, 1)
-        if command in ("stop", "reset", "boom_down_until_contact"):
+        if command in ("stop", "reset") or command in GUARD_CONTACT_COMMANDS or command in AXIS_STOP_COMMANDS:
             return True
+        if command in GUARD_CLEARANCE_COMMANDS:
+            return 0.0 <= value <= MAX_GUARD_CLEARANCE_M
         with self._lock:
             joint = ABSOLUTE_JOINT_COMMANDS.get(command)
             if joint is not None:

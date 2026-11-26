@@ -12,6 +12,7 @@ def generate_launch_description() -> LaunchDescription:
             *[DeclareLaunchArgument(name, default_value=str(default)) for name, default in (
                 ("client_lease_sec", 2.0), ("max_dispatch_delay_sec", 1.0), ("ground_timeout_sec", 0.5),
                 ("ground_slow_distance_m", 0.2), ("ground_slow_speed_deg_s", 1.0),
+                ("arm_ground_slow_speed_deg_s", 2.0), ("bucket_ground_slow_speed_deg_s", 4.0),
                 *[ (f"{a}_serial_arrival_tolerance_deg", v) for a, v in
                    (("swing", 1.5), ("boom", 2.5), ("arm", 5.5), ("bucket", 5.5))],
                 ("serial_arrival_speed_deg_s", 2.0), ("serial_arrival_timeout_sec", 10.0),
@@ -81,6 +82,7 @@ def generate_launch_description() -> LaunchDescription:
                         **{name: ParameterValue(LaunchConfiguration(name), value_type=float)
                            for name in ("client_lease_sec", "max_dispatch_delay_sec", "ground_timeout_sec",
                                         "ground_slow_distance_m", "ground_slow_speed_deg_s",
+                                        "arm_ground_slow_speed_deg_s", "bucket_ground_slow_speed_deg_s",
                                         "swing_load_stall_lead_deg",
                                         "boom_load_stall_lead_deg",
                                         "arm_load_stall_lead_deg",

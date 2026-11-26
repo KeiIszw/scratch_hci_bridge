@@ -15,18 +15,18 @@ from bridge_test_helpers import Harness
 
 def start(s, now=0):
     s.update_ground_contact(0, now=now)
-    assert s.start_ground_guard(20, speed_limit_deg_s=10, now=now)
+    assert s.start_ground_guard('boom_down', speed_limit_deg_s=10, now=now, travel_deg=20)
 
 
 def test_unknown_start_and_feedback_rejected_without_plan():
     s = scheduler()
-    assert not s.start_ground_guard(10, now=0)
+    assert not s.start_ground_guard('boom_down', now=0, travel_deg=10)
     assert s.guard_status() == 'failed' and not s.has_work()
     s.update_ground_contact(0, now=0)
-    assert not s.start_ground_guard(10, now=1)
+    assert not s.start_ground_guard('boom_down', now=1, travel_deg=10)
     s = TrajectoryScheduler()
     s.update_ground_contact(0, now=0)
-    assert not s.start_ground_guard(10, now=0)
+    assert not s.start_ground_guard('boom_down', now=0, travel_deg=10)
 
 
 def test_hold_uses_measured_position_discards_remaining_boom_only():

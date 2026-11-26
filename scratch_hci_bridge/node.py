@@ -25,6 +25,9 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from scratch_hci_bridge.command_state import (
     ABSOLUTE_JOINT_COMMANDS,
     RELATIVE_JOINT_COMMANDS,
+    GUARD_CONTACT_COMMANDS,
+    GUARD_CLEARANCE_COMMANDS,
+    AXIS_STOP_COMMANDS,
     CommandState,
     JOINT_NAMES,
     is_ros_duration_safe,
@@ -287,6 +290,8 @@ class ScratchHciBridge(Node):
             serial_arrival_timeout_sec=self.declare_parameter('serial_arrival_timeout_sec', 10.0).value,
             ground_slow_distance_m=self.declare_parameter('ground_slow_distance_m', 0.2).value,
             ground_slow_speed_deg_s=self.declare_parameter('ground_slow_speed_deg_s', 1.0).value,
+            arm_ground_slow_speed_deg_s=self.declare_parameter('arm_ground_slow_speed_deg_s', 2.0).value,
+            bucket_ground_slow_speed_deg_s=self.declare_parameter('bucket_ground_slow_speed_deg_s', 4.0).value,
             ground_stall_sec=self.declare_parameter('ground_stall_sec', 0.5).value,
             ground_stall_epsilon_deg=self.declare_parameter('ground_stall_epsilon_deg', 0.1).value,
             feedback_timeout_sec=self._joint_state_timeout_sec,
@@ -372,14 +377,24 @@ class ScratchHciBridge(Node):
                 return
             if command in ("left_crawler_speed", "right_crawler_speed"):
                 self._trajectory_scheduler.accept_motion()
-            if command == 'boom_down_until_contact':
+            guard_motion = GUARD_CONTACT_COMMANDS.get(command) or GUARD_CLEARANCE_COMMANDS.get(command)
+            if guard_motion is not None:
+                joint = RELATIVE_JOINT_COMMANDS[guard_motion].joint
                 snapshot = self._state.snapshot()
-                accepted = self._trajectory_scheduler.start_ground_guard(value,
-                    snapshot.joint_speed_limits_deg_s['boom'], self._trajectory_duration_sec)
+                accepted = self._trajectory_scheduler.start_ground_guard(guard_motion,
+                    snapshot.joint_speed_limits_deg_s[joint], self._trajectory_duration_sec,
+                    clearance_m=value if command in GUARD_CLEARANCE_COMMANDS else None)
                 if not accepted:
                     # HTTP拡張が400を無視しても、guard_statusとmotion_statusから異常を検出する。
                     self._stop_motion('ground_guard_rejected')
                 return accepted
+            if command in AXIS_STOP_COMMANDS:
+                # 止める位置が決まらない（実測が古い等）時は、全体を安全停止させる。
+                if not self._trajectory_scheduler.stop_axis(AXIS_STOP_COMMANDS[command]):
+                    self._stop_motion('axis_stop_rejected')
+                    return False
+                self._refresh_active_axis_mask()
+                return True
             relative_command = RELATIVE_JOINT_COMMANDS.get(command)
             absolute_joint = ABSOLUTE_JOINT_COMMANDS.get(command)
             if absolute_joint in DIRECT_JOINT_NAMES:
@@ -427,6 +442,8 @@ class ScratchHciBridge(Node):
         scheduler = self._trajectory_scheduler
         if command == 'joint_angle':
             return scheduler.joint_angle(index)
+        if command == 'axis_moving':
+            return scheduler.axis_moving(index)
         if command == 'stall_position':
             return scheduler.stall_position(index)
         if command == 'stall_joints':
@@ -656,8 +673,9 @@ class ScratchHciBridge(Node):
                     and http_name in self._trajectory_scheduler.resistance_blocks_old_goal(scheduled)):
                 # 遅着した旧goalの位置出力で、固定保持角を未達目標へ戻さない。
                 continue
-            if (http_name == 'boom' and getattr(self, '_trajectory_scheduler', None) is not None
-                    and self._trajectory_scheduler.guard_blocks_old_boom(scheduled)):
+            if (getattr(self, '_trajectory_scheduler', None) is not None
+                    and http_name == self._trajectory_scheduler.guard_axis()
+                    and self._trajectory_scheduler.guard_blocks_old_target(scheduled)):
                 # 応答待ち中に実測が下がった場合、位置出力側にも古い保持角を流さない。
                 continue
             message = Float64()
@@ -712,10 +730,10 @@ class ScratchHciBridge(Node):
             active_joints.update(scheduler.resistance_held_axes())
             active_joints.difference_update(scheduler.resistance_blocks_old_goal(
                 scheduled or getattr(self, '_active_goal_scheduled', None)))
-        blocks_old_boom = getattr(scheduler, 'guard_blocks_old_boom', None)
-        if blocks_old_boom and blocks_old_boom(getattr(self, '_active_goal_scheduled', None)):
-            # 接地後にAction応答が遅れても、旧目標への追従出力で下降を続けない。
-            active_joints.discard('boom')
+        blocks_old_target = getattr(scheduler, 'guard_blocks_old_target', None)
+        if blocks_old_target and blocks_old_target(getattr(self, '_active_goal_scheduled', None)):
+            # 接地後にAction応答が遅れても、旧目標への追従出力で地面へ押し続けない。
+            active_joints.discard(scheduler.guard_axis())
         mask = 0
         for bit, (http_name, _) in enumerate(PID_JOINTS):
             if http_name in active_joints:
